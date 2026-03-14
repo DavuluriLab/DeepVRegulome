@@ -87,7 +87,7 @@ See figures/attention/ for examples like CTCFL.
 ## 🌐 Live Demo
 
 An interactive instance of the DeepVRegulome dashboard is hosted here:
-➡️ **https://davuluri-lab-brainved.streamlit.app/**
+➡️ [https://deepvregulome.streamlit.app/](https://deepvregulome.streamlit.app/)
 The deployed app lets you browse model performance metrics and variant-effect predictions without installing any software locally.
 
 ## 🧬 Model Checkpoints
