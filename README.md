@@ -88,7 +88,7 @@ See figures/attention/ for examples like CTCFL.
 
 An interactive instance of the DeepVRegulome dashboard is hosted here:
 ➡️ [https://deepvregulome.streamlit.app/](https://deepvregulome.streamlit.app/)
-The deployed app lets you browse model performance metrics and variant-effect predictions without installing any software locally.
+The deployed app allows you to explore model performance metrics and variant-effect predictions without the need to install any software locally.
 
 ## 🧬 Model Checkpoints
 Full DNABERT fine-tuned weights (acceptor, donor, and 700 TFBS models) will be deposited in Zenodo and made publicly available immediately upon journal acceptance.
@@ -96,7 +96,17 @@ In the meantime, researchers may request access by emailing pratik.dutta@stonybr
 
 ## Citation
 If you use DeepVRegulome in your research, please cite:
-
+```
+@misc{dutta2025deepvregulomednabertbaseddeeplearningframework,
+      title={DeepVRegulome: DNABERT-based deep-learning framework for predicting the functional impact of short genomic variants on the human regulome}, 
+      author={Pratik Dutta and Matthew Obusan and Rekha Sathian and Max Chao and Pallavi Surana and Nimisha Papineni and Yanrong Ji and Zhihan Zhou and Han Liu and Alisa Yurovsky and Ramana V Davuluri},
+      year={2025},
+      eprint={2511.09026},
+      archivePrefix={arXiv},
+      primaryClass={q-bio.GN},
+      url={https://arxiv.org/abs/2511.09026}, 
+}
+```
 
 
 ## 🧬 Model Checkpoints
