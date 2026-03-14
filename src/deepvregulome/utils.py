@@ -5,7 +5,7 @@ Handles DNA ↔ k-mer conversion, reverse complement, and
 variant sequence extraction from reference genomes.
 """
 
-from typing import Tuple
+from typing import List, Tuple, Optional
 
 
 COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
@@ -39,11 +39,8 @@ def extract_variant_sequences(
     """
     Extract REF and ALT sequences centered on a variant.
 
-    For SNVs: both sequences are (2*flank + 1) bp.
-    For indels: REF and ALT lengths differ by len(alt) - len(ref).
-
     Args:
-        genome: pysam.FastaFile or dict-like with .fetch(chrom, start, end)
+        genome: pysam.FastaFile or object with .fetch(chrom, start, end)
         chrom: Chromosome name (e.g., "chr1")
         pos: 1-based variant position
         ref: Reference allele (e.g., "A")
@@ -52,17 +49,8 @@ def extract_variant_sequences(
 
     Returns:
         (ref_seq, alt_seq) tuple of DNA strings
-
-    Example:
-        For chr1:3456782 A>TA with flank=150:
-        - Extracts 150bp upstream + "A" + 150bp downstream → ref_seq (301bp)
-        - Replaces "A" with "TA" → alt_seq (302bp)
-        Both are then k-merized by the scorer.
     """
-    # Convert to 0-based half-open coordinates
     start_0 = pos - 1  # 0-based position of first ref base
-
-    # Extract flanking sequences
     left_flank = genome.fetch(chrom, start_0 - flank, start_0)
     right_flank = genome.fetch(chrom, start_0 + len(ref), start_0 + len(ref) + flank)
 
@@ -72,26 +60,84 @@ def extract_variant_sequences(
     return ref_seq.upper(), alt_seq.upper()
 
 
-def extract_variant_sequences_from_fasta(
-    fasta_path: str,
-    chrom: str,
-    pos: int,
-    ref: str,
-    alt: str,
+def extract_variant_sequences_batch(
+    genome,
+    variants: list,
     flank: int = 150,
-) -> Tuple[str, str]:
+) -> List[Tuple[str, str]]:
     """
-    Convenience wrapper that opens a FASTA file, extracts sequences, and closes it.
+    Extract REF and ALT sequences for a batch of variants.
 
-    Requires: pip install pysam
+    Args:
+        genome: pysam.FastaFile
+        variants: List of dicts with keys: chrom, pos, ref, alt
+        flank: Flanking bases on each side
+
+    Returns:
+        List of (ref_seq, alt_seq) tuples
     """
-    try:
-        import pysam
-    except ImportError:
-        raise ImportError(
-            "pysam is required for genome-based variant extraction. "
-            "Install with: pip install deepvregulome[genome]"
-        )
+    results = []
+    for v in variants:
+        try:
+            ref_seq, alt_seq = extract_variant_sequences(
+                genome, v["chrom"], v["pos"], v["ref"], v["alt"], flank
+            )
+            results.append((ref_seq, alt_seq))
+        except Exception as e:
+            # Return None pair for failed extractions
+            results.append((None, None))
+    return results
 
-    with pysam.FastaFile(fasta_path) as genome:
-        return extract_variant_sequences(genome, chrom, pos, ref, alt, flank)
+
+def parse_vcf(vcf_path: str, max_variants: Optional[int] = None) -> list:
+    """
+    Parse a VCF file into a list of variant dicts.
+    Handles both with-header and headerless VCF files, plus .vcf.gz.
+
+    Args:
+        vcf_path: Path to VCF file
+        max_variants: Maximum number of variants to parse (None = all)
+
+    Returns:
+        List of dicts with keys: chrom, pos, ref, alt
+        (multi-allelic ALTs are split into separate entries)
+    """
+    import gzip
+
+    opener = gzip.open if vcf_path.endswith(".gz") else open
+    variants = []
+
+    with opener(vcf_path, "rt") as f:
+        for line in f:
+            # Skip header lines
+            if line.startswith("#"):
+                continue
+
+            fields = line.strip().split("\t")
+            if len(fields) < 5:
+                continue
+
+            chrom = fields[0]
+            try:
+                pos = int(fields[1])
+            except ValueError:
+                continue
+            ref = fields[3]
+            alt_str = fields[4]
+
+            # Split multi-allelic
+            for alt in alt_str.split(","):
+                alt = alt.strip()
+                if alt == "." or alt == "*":
+                    continue
+                variants.append({
+                    "chrom": chrom,
+                    "pos": pos,
+                    "ref": ref,
+                    "alt": alt,
+                })
+
+            if max_variants and len(variants) >= max_variants:
+                break
+
+    return variants[:max_variants] if max_variants else variants
