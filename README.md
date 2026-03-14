@@ -110,4 +110,25 @@ If you use DeepVRegulome in your research, please cite:
 
 
 ## 🧬 Model Checkpoints
+462 fine-tuned DNABERT models (458 TFs + 4 histone marks) are available on HuggingFace:
+➡️ [duttaprat/DeepVRegulome](https://huggingface.co/duttaprat/DeepVRegulome)
+```python
+pip install deepvregulome
+
+from deepvregulome import DVR
+dvr = DVR(genome="hg38.fa")
+result = dvr.score_variant("chr1", 3456782, "A", "C", models=["CTCFL", "SP1"])
+```
+
+**After editing both files on GitHub**, rebuild and re-upload to PyPI:
+```bash
+cd /vast/home/pdutta/Github/dvr_package
+git pull   # get the README changes
+python -m build
+~/.local/bin/twine upload dist/* --skip-existing
+```
+
+The `--skip-existing` flag is important — it won't fail on the already-uploaded files and will only upload the new version if you bump the version number. Actually, for a new release you'll need to change `version = "0.1.1"` in `pyproject.toml` first, since PyPI won't accept the same version twice.
+
+
 MIT. See [LICENSE](LICENSE) for details.
