@@ -11,7 +11,6 @@ license = {text = "CC-BY-NC-4.0"}
 requires-python = ">=3.8"
 authors = [
     {name = "Pratik Dutta", email = "pratik.dutta@stonybrook.edu"},
-    {name = "Ramana V. Davuluri"},
 ]
 keywords = [
     "genomics", "variant-effect-prediction", "dnabert",
