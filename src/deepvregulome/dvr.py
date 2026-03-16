@@ -1,12 +1,13 @@
 """
 DVR: Main interface for DeepVRegulome variant effect prediction.
 
-Features:
-    - Automatic coordinate sanity check (detects 1-based vs 0-based)
-    - Scoring: log2 odds ratio + score_change (matching published pipeline)
-    - Multi-GPU parallelism, batched inference, OOM-safe memory management
-    - VCF support (with/without headers, .vcf.gz)
-    - Attention-based interpretability
+v0.1.4:
+    - tqdm progress bars for all long-running operations
+    - Parallel sequence extraction (multiprocessing)
+    - log2 scoring matching published pipeline
+    - Coordinate sanity check (auto-detect 1-based vs 0-based)
+    - Multi-GPU model distribution
+    - OOM-safe (1 model at a time per GPU)
 """
 
 import math
@@ -27,6 +28,17 @@ from deepvregulome.utils import (
     detect_coordinate_system,
 )
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    # Fallback: no progress bar, just iterate
+    def tqdm(iterable, **kwargs):
+        desc = kwargs.get("desc", "")
+        total = kwargs.get("total", None)
+        if desc and total:
+            print(f"  {desc} ({total} items)...")
+        return iterable
+
 
 # ---------------------------------------------------------------------------
 # Scoring (matching published DeepVRegulome pipeline)
@@ -35,10 +47,8 @@ def _compute_scores(p_ref: float, p_alt: float) -> dict:
     eps = 1e-7
     p_ref_c = max(eps, min(1 - eps, p_ref))
     p_alt_c = max(eps, min(1 - eps, p_alt))
-
     lo_ref = math.log2(p_ref_c / (1 - p_ref_c))
     lo_alt = math.log2(p_alt_c / (1 - p_alt_c))
-
     return {
         "log_odds_ratio": round(lo_ref - lo_alt, 4),
         "score_change": round((p_alt - p_ref) * max(p_ref, p_alt), 6),
@@ -68,7 +78,9 @@ def _gpu_worker(
         model = model.to(device)
         model.eval()
 
-        for batch_start in range(0, len(ref_seqs), batch_size):
+        n_batches = math.ceil(len(ref_seqs) / batch_size)
+        for batch_idx in range(n_batches):
+            batch_start = batch_idx * batch_size
             batch_end = min(batch_start + batch_size, len(ref_seqs))
             batch_refs = ref_seqs[batch_start:batch_end]
             batch_alts = alt_seqs[batch_start:batch_end]
@@ -116,8 +128,7 @@ def _gpu_worker(
 
         del model
         torch.cuda.empty_cache()
-        if (model_idx + 1) % 10 == 0:
-            print(f"  [GPU {gpu_id}] Scored {model_idx + 1}/{len(model_names)} models")
+        print(f"  [GPU {gpu_id}] ✓ {name} ({model_idx + 1}/{len(model_names)})")
 
     result_queue.put(all_results)
 
@@ -128,14 +139,6 @@ class DVR:
 
     Output columns (default):
         model, type, prob_ref, prob_alt, log_odds_ratio, score_change
-
-    Scoring:
-        log_odds_ratio = log2(p_ref/(1-p_ref)) - log2(p_alt/(1-p_alt))
-        score_change = (p_alt - p_ref) * max(p_ref, p_alt)
-
-    Coordinate handling:
-        Automatically detects 1-based (VCF) vs 0-based (BED) coordinates
-        by checking REF alleles against the reference genome.
     """
 
     def __init__(
@@ -145,20 +148,13 @@ class DVR:
         cache_dir: Optional[str] = None,
         coordinate_system: Optional[str] = None,
     ):
-        """
-        Args:
-            genome: Path to reference genome FASTA (hg38).
-            device: "cuda", "cuda:0", "cpu", etc. Auto-detected if None.
-            cache_dir: Directory for caching HF models.
-            coordinate_system: Force "1-based" or "0-based". If None, auto-detects.
-        """
         self.registry = ModelRegistry()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.cache_dir = cache_dir
         self._genome_path = genome
         self._genome = None
-        self._coordinate_system = coordinate_system  # None = auto-detect
-        self._coord_offset = None  # set by sanity check
+        self._coordinate_system = coordinate_system
+        self._coord_offset = None
 
     @property
     def genome(self):
@@ -180,32 +176,22 @@ class DVR:
         return self._genome
 
     def _run_sanity_check(self, variants: list):
-        """
-        Run coordinate sanity check on first N variants.
-        Sets self._coord_offset (1 for 1-based, 0 for 0-based).
-        Only runs once per DVR instance unless coordinate_system changes.
-        """
         if self._coord_offset is not None:
-            return  # already determined
-
+            return
         if self._coordinate_system == "1-based":
             self._coord_offset = 1
-            print("✓ Coordinate system set to 1-based (user override). Positions will be adjusted (pos → pos-1).")
+            print("✓ Coordinate system: 1-based (user override). pos → pos-1")
             return
         elif self._coordinate_system == "0-based":
             self._coord_offset = 0
-            print("✓ Coordinate system set to 0-based (user override). Positions used as-is.")
+            print("✓ Coordinate system: 0-based (user override). pos used as-is.")
             return
-
-        # Auto-detect
         result = detect_coordinate_system(self.genome, variants)
         self._coord_offset = result["offset"]
         print(result["message"])
 
     def _adjust_pos(self, pos: int) -> int:
-        """Convert input position to 0-based for pysam."""
         if self._coord_offset is None:
-            # No sanity check run yet, default to 1-based (VCF standard)
             return pos - 1
         return pos - self._coord_offset
 
@@ -262,7 +248,7 @@ class DVR:
         }
 
     # ------------------------------------------------------------------
-    # Internal: single-GPU scoring (memory-safe)
+    # Internal: single-GPU scoring (memory-safe, with tqdm)
     # ------------------------------------------------------------------
     def _score_sequences_single_gpu(
         self, ref_seqs, alt_seqs, model_names,
@@ -271,11 +257,22 @@ class DVR:
         device = device or self.device
         results = []
 
-        for model_idx, name in enumerate(model_names):
+        model_pbar = tqdm(model_names, desc="Models", unit="model")
+        for model_idx, name in enumerate(model_pbar):
+            model_pbar.set_postfix(current=name)
             info = self.registry.get(name)
             model, tokenizer = self._load_model_to_device(name, device)
 
-            for batch_start in range(0, len(ref_seqs), batch_size):
+            n_batches = math.ceil(len(ref_seqs) / batch_size)
+            batch_pbar = tqdm(
+                range(n_batches),
+                desc=f"  {name}",
+                unit="batch",
+                leave=False,
+            )
+
+            for batch_idx in batch_pbar:
+                batch_start = batch_idx * batch_size
                 batch_end = min(batch_start + batch_size, len(ref_seqs))
                 br = ref_seqs[batch_start:batch_end]
                 ba = alt_seqs[batch_start:batch_end]
@@ -284,15 +281,15 @@ class DVR:
                     ro = self._predict_single(model, tokenizer, br[0], device, return_attention)
                     ao = self._predict_single(model, tokenizer, ba[0], device, return_attention)
                     rp, ap = [ro["prob"]], [ao["prob"]]
-                    ra = [ro.get("attention")] if return_attention else [None]
-                    aa = [ao.get("attention")] if return_attention else [None]
+                    ra_list = [ro.get("attention")] if return_attention else [None]
+                    aa_list = [ao.get("attention")] if return_attention else [None]
                 else:
                     ros = self._predict_batch(model, tokenizer, br, device, return_attention)
                     aos = self._predict_batch(model, tokenizer, ba, device, return_attention)
                     rp = [r["prob"] for r in ros]
                     ap = [r["prob"] for r in aos]
-                    ra = [r.get("attention") for r in ros] if return_attention else [None]*len(ros)
-                    aa = [r.get("attention") for r in aos] if return_attention else [None]*len(aos)
+                    ra_list = [r.get("attention") for r in ros] if return_attention else [None]*len(ros)
+                    aa_list = [r.get("attention") for r in aos] if return_attention else [None]*len(aos)
 
                 for i in range(len(br)):
                     scores = _compute_scores(rp[i], ap[i])
@@ -307,14 +304,12 @@ class DVR:
                     if verbose:
                         row["log_odds_ref"] = scores["_log_odds_ref"]
                         row["log_odds_alt"] = scores["_log_odds_alt"]
-                    if return_attention and ra[i] is not None and aa[i] is not None:
-                        row.update(self._compute_attention_change(ra[i], aa[i]))
+                    if return_attention and ra_list[i] is not None and aa_list[i] is not None:
+                        row.update(self._compute_attention_change(ra_list[i], aa_list[i]))
                     results.append(row)
 
             del model, tokenizer
             torch.cuda.empty_cache()
-            if (model_idx + 1) % 10 == 0:
-                print(f"  Scored {model_idx + 1}/{len(model_names)} models...")
 
         return results
 
@@ -360,7 +355,7 @@ class DVR:
         return all_results
 
     # ==================================================================
-    # PUBLIC API: score_sequence
+    # PUBLIC API
     # ==================================================================
     def score_sequence(
         self,
@@ -398,41 +393,27 @@ class DVR:
             df = df.sort_values("log_odds_ratio", ascending=False, key=abs)
         return df.reset_index(drop=True)
 
-    # ==================================================================
-    # PUBLIC API: score_variant
-    # ==================================================================
     def score_variant(
         self, chrom: str, pos: int, ref: str, alt: str,
         models=None, model_type=None, flank: int = 150,
         batch_size: int = 1, gpus=None,
         return_attention: bool = False, verbose: bool = False,
     ) -> pd.DataFrame:
-        """
-        Score a single variant by genomic coordinates.
-        Runs coordinate sanity check on first call.
-        """
-        # Run sanity check with this single variant
+        """Score a single variant by genomic coordinates."""
         self._run_sanity_check([{"chrom": chrom, "pos": pos, "ref": ref, "alt": alt}])
-
         pos_0 = self._adjust_pos(pos)
-
         ref_seq, alt_seq = extract_variant_sequences(
             self.genome, chrom, pos_0, ref, alt, flank=flank)
-
         df = self.score_sequence(
             ref_seq, alt_seq, models=models, model_type=model_type,
             batch_size=batch_size, gpus=gpus,
             return_attention=return_attention, verbose=verbose)
-
         df.insert(0, "chrom", chrom)
-        df.insert(1, "pos", pos)  # keep original pos in output
+        df.insert(1, "pos", pos)
         df.insert(2, "ref", ref)
         df.insert(3, "alt", alt)
         return df
 
-    # ==================================================================
-    # PUBLIC API: score_variants (batch from DataFrame)
-    # ==================================================================
     def score_variants(
         self, variants: pd.DataFrame,
         models=None, model_type=None, flank: int = 150,
@@ -446,10 +427,10 @@ class DVR:
 
         variant_list = variants[["chrom", "pos", "ref", "alt"]].to_dict("records")
 
-        # Sanity check on first 10 variants
+        # Sanity check
         self._run_sanity_check(variant_list)
 
-        # Adjust all positions to 0-based
+        # Adjust positions to 0-based
         adjusted = []
         for v in variant_list:
             adjusted.append({
@@ -459,8 +440,11 @@ class DVR:
                 "alt": v["alt"],
             })
 
+        # Parallel sequence extraction with tqdm
         print(f"Extracting sequences for {len(variants)} variants...")
-        seq_pairs = extract_variant_sequences_batch(self.genome, adjusted, flank)
+        seq_pairs = extract_variant_sequences_batch(
+            self._genome_path, adjusted, flank
+        )
 
         valid_indices, ref_seqs, alt_seqs = [], [], []
         for i, (r, a) in enumerate(seq_pairs):
@@ -470,7 +454,8 @@ class DVR:
                 alt_seqs.append(a)
 
         if len(valid_indices) < len(variants):
-            warnings.warn(f"Failed to extract sequences for {len(variants) - len(valid_indices)} variants")
+            n_failed = len(variants) - len(valid_indices)
+            warnings.warn(f"Failed to extract sequences for {n_failed} variants")
         if not ref_seqs:
             return pd.DataFrame()
 
@@ -502,9 +487,6 @@ class DVR:
             df = df.sort_values("log_odds_ratio", ascending=False, key=abs)
         return df.reset_index(drop=True)
 
-    # ==================================================================
-    # PUBLIC API: score_vcf
-    # ==================================================================
     def score_vcf(
         self, vcf_path: str,
         models=None, model_type=None, flank: int = 150,
@@ -512,7 +494,7 @@ class DVR:
         return_attention: bool = False, verbose: bool = False,
         max_variants: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Score all variants in a VCF file (handles with/without headers, .vcf.gz)."""
+        """Score all variants in a VCF file."""
         print(f"Parsing VCF: {vcf_path}")
         variant_list = parse_vcf(vcf_path, max_variants=max_variants)
         print(f"  Found {len(variant_list)} variants")

@@ -2,23 +2,20 @@
 Sequence processing utilities for DeepVRegulome.
 
 Handles DNA ↔ k-mer conversion, reverse complement,
-variant sequence extraction, VCF parsing, and coordinate sanity checking.
+variant sequence extraction (with multiprocessing),
+VCF parsing, and coordinate sanity checking.
 """
 
+import os
 from typing import List, Tuple, Optional
+from multiprocessing import Pool
 
 
 COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
 
 def to_kmer(sequence: str, k: int = 6) -> str:
-    """
-    Convert a DNA sequence to space-separated k-mer representation for DNABERT.
-
-    Example:
-        >>> to_kmer("ATCGATCG", k=6)
-        'ATCGAT TCGATC CGATCG'
-    """
+    """Convert a DNA sequence to space-separated k-mer representation for DNABERT."""
     seq = sequence.upper()
     return " ".join(seq[i:i + k] for i in range(len(seq) - k + 1))
 
@@ -42,7 +39,7 @@ def extract_variant_sequences(
     Args:
         genome: pysam.FastaFile
         chrom: Chromosome (e.g., "chr1")
-        pos_0based: 0-based variant position (already adjusted by sanity check)
+        pos_0based: 0-based variant position
         ref: Reference allele
         alt: Alternate allele
         flank: Flanking bases on each side
@@ -59,35 +56,96 @@ def extract_variant_sequences(
     return ref_seq.upper(), alt_seq.upper()
 
 
+# ---------------------------------------------------------------------------
+# Parallel sequence extraction
+# ---------------------------------------------------------------------------
+
+# Module-level global for multiprocessing workers
+_worker_genome = None
+_worker_flank = None
+
+
+def _init_extraction_worker(genome_path: str, flank: int):
+    """Initialize pysam.FastaFile in each worker process."""
+    global _worker_genome, _worker_flank
+    import pysam
+    _worker_genome = pysam.FastaFile(genome_path)
+    _worker_flank = flank
+
+
+def _extract_one_variant(variant: dict) -> Tuple[Optional[str], Optional[str]]:
+    """Extract sequences for a single variant (called by worker)."""
+    global _worker_genome, _worker_flank
+    try:
+        ref_seq, alt_seq = extract_variant_sequences(
+            _worker_genome,
+            variant["chrom"],
+            variant["pos"],
+            variant["ref"],
+            variant["alt"],
+            _worker_flank,
+        )
+        return (ref_seq, alt_seq)
+    except Exception:
+        return (None, None)
+
+
 def extract_variant_sequences_batch(
-    genome,
+    genome_path: str,
     variants: list,
     flank: int = 150,
-) -> List[Tuple[str, str]]:
+    n_workers: int = 0,
+) -> List[Tuple[Optional[str], Optional[str]]]:
     """
     Extract REF and ALT sequences for a batch of variants.
-    Expects variants with pos already in 0-based (adjusted by sanity check).
+    Uses multiprocessing when n_workers > 1 for speed.
+
+    Args:
+        genome_path: Path to reference genome FASTA (string, not pysam object)
+        variants: List of dicts with chrom, pos, ref, alt (pos already 0-based)
+        flank: Flanking bases on each side
+        n_workers: Number of parallel workers. 0 = auto (cpu_count/2, min 1).
+
+    Returns:
+        List of (ref_seq, alt_seq) tuples. Failed extractions return (None, None).
     """
-    results = []
-    for v in variants:
-        try:
-            ref_seq, alt_seq = extract_variant_sequences(
-                genome, v["chrom"], v["pos"], v["ref"], v["alt"], flank
-            )
-            results.append((ref_seq, alt_seq))
-        except Exception:
-            results.append((None, None))
+    if n_workers == 0:
+        n_workers = max(1, os.cpu_count() // 2)
+
+    if n_workers == 1 or len(variants) < 100:
+        # Single-threaded for small inputs
+        import pysam
+        genome = pysam.FastaFile(genome_path)
+        results = []
+        for v in variants:
+            try:
+                ref_seq, alt_seq = extract_variant_sequences(
+                    genome, v["chrom"], v["pos"], v["ref"], v["alt"], flank
+                )
+                results.append((ref_seq, alt_seq))
+            except Exception:
+                results.append((None, None))
+        genome.close()
+        return results
+
+    # Multi-threaded
+    with Pool(
+        processes=n_workers,
+        initializer=_init_extraction_worker,
+        initargs=(genome_path, flank),
+    ) as pool:
+        results = pool.map(_extract_one_variant, variants, chunksize=500)
+
     return results
 
 
 def parse_vcf(vcf_path: str, max_variants: Optional[int] = None) -> list:
     """
     Parse a VCF file into a list of variant dicts.
-    Handles both with-header and headerless VCFs, plus .vcf.gz.
+    Handles both with-header and headerless VCFs.
 
     Returns:
         List of dicts with keys: chrom, pos, ref, alt
-        pos is kept as-is from the file (sanity check determines offset later)
     """
     import gzip
 
@@ -135,21 +193,7 @@ def parse_vcf(vcf_path: str, max_variants: Optional[int] = None) -> list:
 def detect_coordinate_system(genome, variants: list, n_check: int = 10) -> dict:
     """
     Auto-detect whether variant positions are 1-based (VCF) or 0-based (BED)
-    by checking if the REF allele matches the reference genome.
-
-    For each variant, checks genome at pos-1 and pos (0-based fetch).
-    Only votes when the result is unambiguous (different bases at the two positions).
-
-    Args:
-        genome: pysam.FastaFile
-        variants: list of dicts with chrom, pos, ref, alt
-        n_check: number of variants to check (default: 10)
-
-    Returns:
-        dict with:
-            system: "1-based" | "0-based" | "unknown"
-            offset: 1 | 0 (subtract this from pos to get 0-based)
-            message: str (human-readable summary)
+    by checking REF alleles against the reference genome.
     """
     to_check = variants[:min(n_check, len(variants))]
 
@@ -186,53 +230,41 @@ def detect_coordinate_system(genome, variants: list, n_check: int = 10) -> dict:
         except Exception:
             no_match += 1
 
-    # Decision
     total_checked = len(to_check)
-    informative = votes_1based + votes_0based
 
     if votes_1based >= 3 and votes_0based == 0:
-        system, offset = "1-based", 1
-        confidence = "high"
+        system, offset, confidence = "1-based", 1, "high"
     elif votes_0based >= 3 and votes_1based == 0:
-        system, offset = "0-based", 0
-        confidence = "high"
+        system, offset, confidence = "0-based", 0, "high"
     elif votes_1based > votes_0based:
-        system, offset = "1-based", 1
-        confidence = "medium"
+        system, offset, confidence = "1-based", 1, "medium"
     elif votes_0based > votes_1based:
-        system, offset = "0-based", 0
-        confidence = "medium"
+        system, offset, confidence = "0-based", 0, "medium"
     else:
-        system, offset = "1-based", 1
-        confidence = "low"
+        system, offset, confidence = "1-based", 1, "low"
 
-    # Build message
-    if confidence == "high" and system == "1-based":
+    if confidence == "high":
         message = (
-            f"✓ Sanity check PASSED — 1-based coordinates (VCF format) detected\n"
-            f"  Checked {total_checked} variants: {votes_1based} confirmed 1-based, "
-            f"{ambiguous} ambiguous, {no_match} no-match\n"
-            f"  REF alleles match the reference genome. Coordinates look correct."
-        )
-    elif confidence == "high" and system == "0-based":
-        message = (
-            f"✓ Sanity check PASSED — 0-based coordinates (BED format) detected\n"
-            f"  Checked {total_checked} variants: {votes_0based} confirmed 0-based, "
+            f"✓ Sanity check PASSED — {system} coordinates detected\n"
+            f"  Checked {total_checked} variants: "
+            f"{votes_1based} confirm 1-based, {votes_0based} confirm 0-based, "
             f"{ambiguous} ambiguous, {no_match} no-match\n"
             f"  REF alleles match the reference genome. Coordinates look correct."
         )
     elif confidence == "medium":
         message = (
             f"⚠ Sanity check: likely {system} but not fully certain\n"
-            f"  Checked {total_checked} variants: {votes_1based} suggest 1-based, "
-            f"{votes_0based} suggest 0-based, {ambiguous} ambiguous, {no_match} no-match\n"
+            f"  Checked {total_checked} variants: "
+            f"{votes_1based} suggest 1-based, {votes_0based} suggest 0-based, "
+            f"{ambiguous} ambiguous, {no_match} no-match\n"
             f"  Proceeding with {system}. Override with coordinate_system= if needed."
         )
     else:
         message = (
             f"⚠ Sanity check: could not confidently determine coordinate system\n"
-            f"  Checked {total_checked} variants: {votes_1based} suggest 1-based, "
-            f"{votes_0based} suggest 0-based, {ambiguous} ambiguous, {no_match} no-match\n"
+            f"  Checked {total_checked} variants: "
+            f"{votes_1based} suggest 1-based, {votes_0based} suggest 0-based, "
+            f"{ambiguous} ambiguous, {no_match} no-match\n"
             f"  Defaulting to 1-based (VCF standard). Override with coordinate_system='0-based' if needed."
         )
 
