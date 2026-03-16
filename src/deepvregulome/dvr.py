@@ -2,12 +2,12 @@
 DVR: Main interface for DeepVRegulome variant effect prediction.
 
 v0.1.4:
-    - tqdm progress bars for all long-running operations
+    - tqdm progress bars
     - Parallel sequence extraction (multiprocessing)
     - log2 scoring matching published pipeline
-    - Coordinate sanity check (auto-detect 1-based vs 0-based)
-    - Multi-GPU model distribution
-    - OOM-safe (1 model at a time per GPU)
+    - Coordinate sanity check
+    - Multi-GPU model distribution, OOM-safe
+    - Position-level attention: dvr.last_attention + dvr.plot_attention()
 """
 
 import math
@@ -31,7 +31,6 @@ from deepvregulome.utils import (
 try:
     from tqdm.auto import tqdm
 except ImportError:
-    # Fallback: no progress bar, just iterate
     def tqdm(iterable, **kwargs):
         desc = kwargs.get("desc", "")
         total = kwargs.get("total", None)
@@ -55,6 +54,30 @@ def _compute_scores(p_ref: float, p_alt: float) -> dict:
         "_log_odds_ref": round(lo_ref, 4),
         "_log_odds_alt": round(lo_alt, 4),
     }
+
+
+def _attention_summary(attn_ref: np.ndarray, attn_alt: np.ndarray) -> dict:
+    """Compute summary attention metrics."""
+    ref_avg = attn_ref.mean(axis=1)  # avg across heads: [layers, seq, seq]
+    alt_avg = attn_alt.mean(axis=1)
+    diff = alt_avg - ref_avg
+    return {
+        "attention_score_change": round(float(np.sqrt((diff ** 2).sum())), 6),
+        "max_attention_shift": round(float(np.abs(diff).max()), 6),
+        "disrupted_layers": int((np.abs(diff).mean(axis=(1, 2)) > 0.01).sum()),
+        "total_layers": diff.shape[0],
+    }
+
+
+def _position_attention(attn: np.ndarray) -> np.ndarray:
+    """
+    Convert raw attention [layers, heads, seq_len, seq_len] to per-position scores.
+    Returns: [seq_len] array — mean attention received at each position,
+             averaged across all layers and heads.
+    """
+    # Mean across layers and heads, then sum columns (attention received)
+    # attn shape: [layers, heads, seq_len, seq_len]
+    return attn.mean(axis=(0, 1)).sum(axis=0)  # [seq_len]
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +141,7 @@ def _gpu_worker(
                 if return_attention and ref_out.attentions and alt_out.attentions:
                     ra = torch.stack(ref_out.attentions)[:, i].cpu().numpy()
                     aa = torch.stack(alt_out.attentions)[:, i].cpu().numpy()
-                    diff = aa.mean(axis=1) - ra.mean(axis=1)
-                    row["attention_score_change"] = round(float(np.sqrt((diff**2).sum())), 6)
-                    row["max_attention_shift"] = round(float(np.abs(diff).max()), 6)
-                    lc = np.abs(diff).mean(axis=(1, 2))
-                    row["disrupted_layers"] = int((lc > 0.01).sum())
-                    row["total_layers"] = len(lc)
+                    row.update(_attention_summary(ra, aa))
                 all_results.append(row)
 
         del model
@@ -139,6 +157,10 @@ class DVR:
 
     Output columns (default):
         model, type, prob_ref, prob_alt, log_odds_ratio, score_change
+
+    Position-level attention (when return_attention=True):
+        After scoring, access dvr.last_attention[model_name] for raw data.
+        Use dvr.plot_attention(model_name) for visualization.
     """
 
     def __init__(
@@ -155,6 +177,9 @@ class DVR:
         self._genome = None
         self._coordinate_system = coordinate_system
         self._coord_offset = None
+
+        # Position-level attention storage (populated when return_attention=True)
+        self.last_attention: Dict[str, dict] = {}
 
     @property
     def genome(self):
@@ -238,22 +263,18 @@ class DVR:
             results.append(r)
         return results
 
-    def _compute_attention_change(self, attn_ref, attn_alt):
-        diff = attn_alt.mean(axis=1) - attn_ref.mean(axis=1)
-        return {
-            "attention_score_change": round(float(np.sqrt((diff**2).sum())), 6),
-            "max_attention_shift": round(float(np.abs(diff).max()), 6),
-            "disrupted_layers": int((np.abs(diff).mean(axis=(1, 2)) > 0.01).sum()),
-            "total_layers": diff.shape[0],
-        }
-
     # ------------------------------------------------------------------
     # Internal: single-GPU scoring (memory-safe, with tqdm)
     # ------------------------------------------------------------------
     def _score_sequences_single_gpu(
         self, ref_seqs, alt_seqs, model_names,
         batch_size=1, return_attention=False, verbose=False, device=None,
+        _store_attention_seqs=None,
     ):
+        """
+        _store_attention_seqs: if provided, a dict of {var_idx: (ref_seq, alt_seq)}
+            used to store raw attention data in self.last_attention
+        """
         device = device or self.device
         results = []
 
@@ -264,12 +285,8 @@ class DVR:
             model, tokenizer = self._load_model_to_device(name, device)
 
             n_batches = math.ceil(len(ref_seqs) / batch_size)
-            batch_pbar = tqdm(
-                range(n_batches),
-                desc=f"  {name}",
-                unit="batch",
-                leave=False,
-            )
+            batch_pbar = tqdm(range(n_batches), desc=f"  {name}",
+                              unit="batch", leave=False)
 
             for batch_idx in batch_pbar:
                 batch_start = batch_idx * batch_size
@@ -292,9 +309,10 @@ class DVR:
                     aa_list = [r.get("attention") for r in aos] if return_attention else [None]*len(aos)
 
                 for i in range(len(br)):
+                    var_idx = batch_start + i
                     scores = _compute_scores(rp[i], ap[i])
                     row = {
-                        "_var_idx": batch_start + i,
+                        "_var_idx": var_idx,
                         "model": name, "type": info.model_type,
                         "prob_ref": round(rp[i], 6),
                         "prob_alt": round(ap[i], 6),
@@ -304,8 +322,28 @@ class DVR:
                     if verbose:
                         row["log_odds_ref"] = scores["_log_odds_ref"]
                         row["log_odds_alt"] = scores["_log_odds_alt"]
+
                     if return_attention and ra_list[i] is not None and aa_list[i] is not None:
-                        row.update(self._compute_attention_change(ra_list[i], aa_list[i]))
+                        row.update(_attention_summary(ra_list[i], aa_list[i]))
+
+                        # Store position-level attention
+                        ref_pos_attn = _position_attention(ra_list[i])
+                        alt_pos_attn = _position_attention(aa_list[i])
+
+                        if name not in self.last_attention:
+                            self.last_attention[name] = {}
+                        self.last_attention[name][var_idx] = {
+                            "ref_attention": ref_pos_attn,   # [seq_len]
+                            "alt_attention": alt_pos_attn,   # [seq_len]
+                            "diff_attention": alt_pos_attn - ref_pos_attn,  # [seq_len]
+                            "ref_raw": ra_list[i],           # [layers, heads, seq, seq]
+                            "alt_raw": aa_list[i],
+                            "ref_seq": br[i] if _store_attention_seqs else None,
+                            "alt_seq": ba[i] if _store_attention_seqs else None,
+                            "prob_ref": rp[i],
+                            "prob_alt": ap[i],
+                        }
+
                     results.append(row)
 
             del model, tokenizer
@@ -374,6 +412,10 @@ class DVR:
 
         model_names = self._resolve_models(models, model_type)
 
+        # Clear previous attention data
+        if return_attention:
+            self.last_attention = {}
+
         if gpus and len(gpus) > 1:
             raw = self._score_sequences_multi_gpu(
                 ref_seqs, alt_seqs, model_names,
@@ -384,7 +426,8 @@ class DVR:
             raw = self._score_sequences_single_gpu(
                 ref_seqs, alt_seqs, model_names,
                 batch_size=batch_size, return_attention=return_attention,
-                verbose=verbose, device=device)
+                verbose=verbose, device=device,
+                _store_attention_seqs=return_attention)
 
         df = pd.DataFrame(raw)
         if "_var_idx" in df.columns:
@@ -412,6 +455,17 @@ class DVR:
         df.insert(1, "pos", pos)
         df.insert(2, "ref", ref)
         df.insert(3, "alt", alt)
+
+        # Store sequence info in attention data
+        if return_attention:
+            for model_name in self.last_attention:
+                for var_idx in self.last_attention[model_name]:
+                    self.last_attention[model_name][var_idx]["ref_seq"] = ref_seq
+                    self.last_attention[model_name][var_idx]["alt_seq"] = alt_seq
+                    self.last_attention[model_name][var_idx]["variant_pos"] = flank
+                    self.last_attention[model_name][var_idx]["chrom"] = chrom
+                    self.last_attention[model_name][var_idx]["genomic_pos"] = pos
+
         return df
 
     def score_variants(
@@ -421,30 +475,42 @@ class DVR:
         return_attention: bool = False, verbose: bool = False,
     ) -> pd.DataFrame:
         """Score multiple variants from a DataFrame (columns: chrom, pos, ref, alt)."""
+        # Auto-detect column names
+        col_map = {}
+        for col in variants.columns:
+            cl = col.lower().strip()
+            if cl in ("chrom", "chr", "#chrom"):
+                col_map[col] = "chrom"
+            elif cl in ("pos", "start", "position"):
+                col_map[col] = "pos"
+            elif cl in ("ref", "reference", "ref_allele"):
+                col_map[col] = "ref"
+            elif cl in ("alt", "alternative", "alt_allele"):
+                col_map[col] = "alt"
+
+        if col_map:
+            variants = variants.rename(columns=col_map)
+
         required = {"chrom", "pos", "ref", "alt"}
         if not required.issubset(variants.columns):
-            raise ValueError(f"Missing columns: {required - set(variants.columns)}")
+            missing = required - set(variants.columns)
+            raise ValueError(
+                f"Missing columns: {missing}. "
+                f"Expected: chrom, pos, ref, alt (or CHROM, start, REF, ALT)"
+            )
 
         variant_list = variants[["chrom", "pos", "ref", "alt"]].to_dict("records")
-
-        # Sanity check
         self._run_sanity_check(variant_list)
 
-        # Adjust positions to 0-based
         adjusted = []
         for v in variant_list:
             adjusted.append({
-                "chrom": v["chrom"],
-                "pos": self._adjust_pos(v["pos"]),
-                "ref": v["ref"],
-                "alt": v["alt"],
+                "chrom": v["chrom"], "pos": self._adjust_pos(v["pos"]),
+                "ref": v["ref"], "alt": v["alt"],
             })
 
-        # Parallel sequence extraction with tqdm
         print(f"Extracting sequences for {len(variants)} variants...")
-        seq_pairs = extract_variant_sequences_batch(
-            self._genome_path, adjusted, flank
-        )
+        seq_pairs = extract_variant_sequences_batch(self._genome_path, adjusted, flank)
 
         valid_indices, ref_seqs, alt_seqs = [], [], []
         for i, (r, a) in enumerate(seq_pairs):
@@ -454,13 +520,15 @@ class DVR:
                 alt_seqs.append(a)
 
         if len(valid_indices) < len(variants):
-            n_failed = len(variants) - len(valid_indices)
-            warnings.warn(f"Failed to extract sequences for {n_failed} variants")
+            warnings.warn(f"Failed to extract sequences for {len(variants) - len(valid_indices)} variants")
         if not ref_seqs:
             return pd.DataFrame()
 
         model_names = self._resolve_models(models, model_type)
         print(f"Scoring {len(ref_seqs)} variants × {len(model_names)} models...")
+
+        if return_attention:
+            self.last_attention = {}
 
         if gpus and len(gpus) > 1:
             raw = self._score_sequences_multi_gpu(
@@ -472,7 +540,8 @@ class DVR:
             raw = self._score_sequences_single_gpu(
                 ref_seqs, alt_seqs, model_names,
                 batch_size=batch_size, return_attention=return_attention,
-                verbose=verbose, device=device)
+                verbose=verbose, device=device,
+                _store_attention_seqs=return_attention)
 
         df = pd.DataFrame(raw)
         if len(df) > 0 and "_var_idx" in df.columns:
@@ -504,6 +573,236 @@ class DVR:
             pd.DataFrame(variant_list), models=models, model_type=model_type,
             flank=flank, batch_size=batch_size, gpus=gpus,
             return_attention=return_attention, verbose=verbose)
+
+    # ==================================================================
+    # ATTENTION VISUALIZATION
+    # ==================================================================
+    def get_attention(self, model_name: str, var_idx: int = 0) -> dict:
+        """
+        Get position-level attention data for a scored variant.
+
+        Args:
+            model_name: Model name (e.g., "ATF4")
+            var_idx: Variant index (0 for single variant scoring)
+
+        Returns:
+            dict with keys:
+                ref_attention: [seq_len] per-position attention for REF
+                alt_attention: [seq_len] per-position attention for ALT
+                diff_attention: [seq_len] ALT - REF attention difference
+                ref_seq: REF DNA sequence
+                alt_seq: ALT DNA sequence
+                variant_pos: position of variant within window
+                prob_ref, prob_alt: binding probabilities
+                ref_raw: [layers, heads, seq, seq] full attention tensor
+                alt_raw: same for ALT
+        """
+        if model_name not in self.last_attention:
+            available = list(self.last_attention.keys())
+            raise KeyError(
+                f"No attention data for '{model_name}'. "
+                f"Available: {available}. "
+                f"Did you run scoring with return_attention=True?"
+            )
+        if var_idx not in self.last_attention[model_name]:
+            available = list(self.last_attention[model_name].keys())
+            raise KeyError(f"Variant index {var_idx} not found. Available: {available}")
+        return self.last_attention[model_name][var_idx]
+
+    def plot_attention(
+        self,
+        model_name: str,
+        var_idx: int = 0,
+        window: int = 20,
+        figsize: Tuple[int, int] = (14, 6),
+        save_path: Optional[str] = None,
+    ):
+        """
+        Plot position-level attention around the variant site.
+
+        Shows REF and ALT attention scores in a ±window bp region around
+        the variant, with the variant position highlighted.
+
+        Args:
+            model_name: Model name (e.g., "ATF4")
+            var_idx: Variant index (0 for single variant)
+            window: Bases to show on each side of variant (default: 20)
+            figsize: Figure size
+            save_path: If provided, save figure to this path
+
+        Returns:
+            matplotlib Figure object
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+        except ImportError:
+            raise ImportError("matplotlib is required for plotting. pip install matplotlib")
+
+        data = self.get_attention(model_name, var_idx)
+        ref_attn = data["ref_attention"]
+        alt_attn = data["alt_attention"]
+        diff_attn = data["diff_attention"]
+        variant_pos = data.get("variant_pos", len(ref_attn) // 2)
+        ref_seq = data.get("ref_seq", "")
+        alt_seq = data.get("alt_seq", "")
+        p_ref = data.get("prob_ref", 0)
+        p_alt = data.get("prob_alt", 0)
+        chrom = data.get("chrom", "")
+        genomic_pos = data.get("genomic_pos", "")
+
+        # Window around variant (in k-mer space, variant_pos maps to similar position)
+        # Attention is in k-mer space (seq_len = len(seq) - k + 1 for k=6)
+        kmer_variant_pos = max(0, variant_pos - 5)  # approximate k-mer position
+        start = max(0, kmer_variant_pos - window)
+        end = min(len(ref_attn), kmer_variant_pos + window + 1)
+
+        ref_window = ref_attn[start:end]
+        alt_window = alt_attn[start:end]
+        diff_window = diff_attn[start:end]
+        positions = np.arange(start, end)
+
+        # Get nucleotides for x-axis labels
+        if ref_seq and len(ref_seq) > end + 5:
+            # Map k-mer positions back to sequence positions (k-mer i covers seq[i:i+6])
+            seq_labels = [ref_seq[p + 3] if p + 3 < len(ref_seq) else "" for p in positions]
+        else:
+            seq_labels = [str(p) for p in positions]
+
+        fig, axes = plt.subplots(3, 1, figsize=figsize, sharex=True,
+                                  gridspec_kw={"height_ratios": [2, 2, 1.5]})
+
+        # Plot 1: REF attention
+        axes[0].bar(positions, ref_window, color="#3498db", alpha=0.8, width=0.8)
+        axes[0].axvline(x=kmer_variant_pos, color="red", linewidth=1.5, linestyle="--", alpha=0.7)
+        axes[0].set_ylabel("Attention")
+        axes[0].set_title(
+            f"{model_name} — REF (wild-type)   |   "
+            f"P(binding) = {p_ref:.4f}",
+            fontsize=11
+        )
+
+        # Plot 2: ALT attention
+        axes[1].bar(positions, alt_window, color="#e74c3c", alpha=0.8, width=0.8)
+        axes[1].axvline(x=kmer_variant_pos, color="red", linewidth=1.5, linestyle="--", alpha=0.7)
+        axes[1].set_ylabel("Attention")
+        axes[1].set_title(
+            f"{model_name} — ALT (mutant)   |   "
+            f"P(binding) = {p_alt:.4f}",
+            fontsize=11
+        )
+
+        # Plot 3: Difference (ALT - REF)
+        colors_diff = ["#e74c3c" if d < 0 else "#2ecc71" for d in diff_window]
+        axes[2].bar(positions, diff_window, color=colors_diff, alpha=0.8, width=0.8)
+        axes[2].axvline(x=kmer_variant_pos, color="red", linewidth=1.5, linestyle="--", alpha=0.7)
+        axes[2].axhline(y=0, color="black", linewidth=0.5)
+        axes[2].set_ylabel("Δ Attention")
+        axes[2].set_xlabel("Position (k-mer index)")
+        axes[2].set_title("Attention Change (ALT − REF)", fontsize=11)
+
+        # X-axis labels
+        if len(seq_labels) <= 50:
+            axes[2].set_xticks(positions)
+            axes[2].set_xticklabels(seq_labels, fontsize=7, rotation=0)
+
+        # Supertitle
+        variant_str = f"{chrom}:{genomic_pos}" if chrom else "variant"
+        fig.suptitle(
+            f"DeepVRegulome Attention: {model_name} at {variant_str}   |   "
+            f"±{window}bp window",
+            fontsize=13, fontweight="bold", y=1.02
+        )
+
+        plt.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved to {save_path}")
+
+        return fig
+
+    def plot_attention_heatmap(
+        self,
+        model_name: str,
+        var_idx: int = 0,
+        window: int = 20,
+        layer: Optional[int] = None,
+        figsize: Tuple[int, int] = (12, 10),
+        save_path: Optional[str] = None,
+    ):
+        """
+        Plot attention heatmap (layer × position) around the variant site.
+
+        Shows how each BERT layer attends to positions near the variant,
+        for both REF and ALT side by side.
+
+        Args:
+            model_name: Model name
+            var_idx: Variant index
+            window: Bases on each side of variant
+            layer: Specific layer to plot (None = all layers summary)
+            figsize: Figure size
+            save_path: Save path
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError("matplotlib required. pip install matplotlib")
+
+        data = self.get_attention(model_name, var_idx)
+        ref_raw = data["ref_raw"]   # [layers, heads, seq, seq]
+        alt_raw = data["alt_raw"]
+        variant_pos = data.get("variant_pos", ref_raw.shape[2] // 2)
+        kmer_vp = max(0, variant_pos - 5)
+        start = max(0, kmer_vp - window)
+        end = min(ref_raw.shape[2], kmer_vp + window + 1)
+
+        # Average across heads, extract window
+        ref_layers = ref_raw.mean(axis=1)[:, start:end, start:end]  # [layers, win, win]
+        alt_layers = alt_raw.mean(axis=1)[:, start:end, start:end]
+
+        # Sum columns to get "attention received" per position per layer
+        ref_heatmap = ref_layers.sum(axis=2)  # [layers, win]
+        alt_heatmap = alt_layers.sum(axis=2)
+
+        fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+        im0 = axes[0].imshow(ref_heatmap, aspect="auto", cmap="Blues")
+        axes[0].set_title(f"REF — {model_name}")
+        axes[0].set_ylabel("Layer")
+        axes[0].set_xlabel("Position")
+        plt.colorbar(im0, ax=axes[0], shrink=0.6)
+
+        im1 = axes[1].imshow(alt_heatmap, aspect="auto", cmap="Reds")
+        axes[1].set_title(f"ALT — {model_name}")
+        axes[1].set_xlabel("Position")
+        plt.colorbar(im1, ax=axes[1], shrink=0.6)
+
+        diff_heatmap = alt_heatmap - ref_heatmap
+        vmax = max(abs(diff_heatmap.min()), abs(diff_heatmap.max()))
+        im2 = axes[2].imshow(diff_heatmap, aspect="auto", cmap="RdBu_r",
+                              vmin=-vmax, vmax=vmax)
+        axes[2].set_title(f"Δ (ALT − REF)")
+        axes[2].set_xlabel("Position")
+        plt.colorbar(im2, ax=axes[2], shrink=0.6)
+
+        # Mark variant position
+        vp_in_window = kmer_vp - start
+        for ax in axes:
+            ax.axvline(x=vp_in_window, color="lime", linewidth=1.5, linestyle="--", alpha=0.8)
+
+        chrom = data.get("chrom", "")
+        gpos = data.get("genomic_pos", "")
+        fig.suptitle(f"Attention Heatmap: {model_name} at {chrom}:{gpos}  ±{window}bp",
+                     fontsize=13, fontweight="bold")
+        plt.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Saved to {save_path}")
+
+        return fig
 
     # ==================================================================
     # Helpers
