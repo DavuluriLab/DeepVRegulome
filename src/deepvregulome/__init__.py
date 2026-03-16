@@ -6,7 +6,7 @@ Usage:
 
     dvr = DVR(genome="/path/to/hg38.fa")
 
-    # Score a single variant
+    # Score a single variant (auto-detects coordinate system)
     result = dvr.score_variant("chr1", 3456782, "A", "TA", models=["CTCF", "SP1"])
 
     # Score from sequences directly
@@ -16,7 +16,7 @@ Usage:
     results = dvr.score_vcf("variants.vcf", models=["CTCF", "SP1", "MYC"])
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"
 
 from deepvregulome.registry import ModelRegistry
 
