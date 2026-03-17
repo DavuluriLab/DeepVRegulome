@@ -34,13 +34,24 @@
 
 ## Installation
 
+### Requirements
+
+- **Python ≥ 3.11
+- **GPU recommended** — DNABERT inference runs on CPU but is significantly faster on CUDA-enabled GPUs
+
+
 ### 1. Install the Python package
 
 ```bash
 pip install deepvregulome
 ```
-
 This installs the core package with PyTorch, Transformers, and HuggingFace Hub.
+
+> **Upgrading:** We release updates frequently with new features and bug fixes. To get the latest version:
+> ```bash
+> pip install deepvregulome --upgrade
+> ```
+> Check your installed version: `python -c "import deepvregulome; print(deepvregulome.__version__)"`
 
 ### 2. Install optional dependencies
 
