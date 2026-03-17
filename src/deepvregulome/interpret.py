@@ -5,23 +5,13 @@ Features:
     1. JASPAR motif scanning (PWM-based, pure Python)
     2. Attention-based motif extraction from DNABERT
     3. Motif comparison (Pearson correlation, like TOMTOM)
-    4. Web logo generation (using logomaker)
+    4. Proper PWM-based web logo generation
 
 Usage:
     from deepvregulome.interpret import MotifAnalyzer
-
-    analyzer = MotifAnalyzer()  # auto-downloads JASPAR on first use
-
-    # After scoring with attention
-    result = dvr.score_variant("chr9", 65385776, "G", "A",
-                                models=["ATF4"], return_attention=True)
-
-    # Full motif analysis
+    analyzer = MotifAnalyzer()
     report = analyzer.analyze_variant(dvr, model_name="ATF4")
-    print(report.jaspar_matches)
-    print(report.disrupted_motifs)
     analyzer.plot_motif_logo(report)
-    analyzer.plot_variant_report(report)
 """
 
 import os
@@ -44,11 +34,7 @@ JASPAR_CACHE = CACHE_DIR / "jaspar2024_core_human.json"
 
 BASES = ["A", "C", "G", "T"]
 BASE_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
-
-# Pseudocount for PWM computation
 PSEUDO = 0.01
-
-# Background frequencies (uniform)
 BG = {"A": 0.25, "C": 0.25, "G": 0.25, "T": 0.25}
 
 
@@ -57,20 +43,18 @@ BG = {"A": 0.25, "C": 0.25, "G": 0.25, "T": 0.25}
 # ---------------------------------------------------------------------------
 @dataclass
 class MotifMatch:
-    """A single motif match at a specific position."""
     motif_id: str
     motif_name: str
-    position: int       # position in sequence (0-based)
-    strand: str         # "+" or "-"
-    score: float        # PWM log-likelihood score
-    max_score: float    # maximum possible score for this motif
-    rel_score: float    # score / max_score (0-1)
-    matched_seq: str    # the actual sequence at this position
+    position: int
+    strand: str
+    score: float
+    max_score: float
+    rel_score: float
+    matched_seq: str
 
 
 @dataclass
 class MotifReport:
-    """Complete motif analysis report for a variant."""
     model_name: str
     chrom: str
     genomic_pos: int
@@ -80,23 +64,26 @@ class MotifReport:
     prob_alt: float
     log_odds_ratio: float
 
-    # JASPAR scanning results
     ref_matches: List[MotifMatch] = field(default_factory=list)
     alt_matches: List[MotifMatch] = field(default_factory=list)
     disrupted_motifs: pd.DataFrame = field(default_factory=pd.DataFrame)
     gained_motifs: pd.DataFrame = field(default_factory=pd.DataFrame)
 
-    # TF-specific results
     tf_own_motif_ref: Optional[MotifMatch] = None
     tf_own_motif_alt: Optional[MotifMatch] = None
     tf_motif_disrupted: bool = False
 
-    # Attention-derived motif
-    learned_pwm: Optional[np.ndarray] = None    # [length, 4]
-    learned_consensus: str = ""
-    learned_jaspar_match: Optional[dict] = None  # best JASPAR match
+    # JASPAR PFM for the TF's own motif (for logo plotting)
+    tf_jaspar_pfm: Optional[np.ndarray] = None
+    tf_jaspar_id: str = ""
+    tf_jaspar_name: str = ""
 
-    # Sequences
+    # Attention-derived motif
+    learned_pfm: Optional[np.ndarray] = None     # [length, 4] weighted PFM
+    learned_consensus: str = ""
+    learned_jaspar_match: Optional[dict] = None
+    learned_jaspar_pfm: Optional[np.ndarray] = None  # best matching JASPAR PFM
+
     ref_seq: str = ""
     alt_seq: str = ""
     variant_pos: int = 0
@@ -106,70 +93,54 @@ class MotifReport:
 # PWM utilities
 # ---------------------------------------------------------------------------
 def pfm_to_pwm(pfm: np.ndarray) -> np.ndarray:
-    """
-    Convert Position Frequency Matrix to Position Weight Matrix (log-odds).
-
-    Args:
-        pfm: [length, 4] count matrix (A, C, G, T)
-
-    Returns:
-        pwm: [length, 4] log-odds matrix
-    """
-    # Normalize to probabilities
     row_sums = pfm.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1
     ppm = pfm / row_sums
-
-    # Add pseudocount
     ppm = (ppm + PSEUDO) / (1 + 4 * PSEUDO)
-
-    # Log-odds vs background
-    bg = np.array([BG["A"], BG["C"], BG["G"], BG["T"]])
-    pwm = np.log2(ppm / bg)
-
-    return pwm
+    bg = np.array([BG[b] for b in BASES])
+    return np.log2(ppm / bg)
 
 
-def score_sequence_with_pwm(seq: str, pwm: np.ndarray) -> float:
-    """Score a sequence against a PWM."""
+def pfm_to_ic(pfm: np.ndarray) -> pd.DataFrame:
+    """Convert PFM to information content matrix for logomaker."""
+    row_sums = pfm.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    ppm = pfm / row_sums
+    ppm = np.clip(ppm, 1e-10, 1.0)
+
+    # Information content: IC_i = 2 + sum(p * log2(p))
+    entropy = -(ppm * np.log2(ppm)).sum(axis=1)
+    ic_total = 2.0 - entropy  # bits
+
+    # Scale each base by its IC contribution
+    ic_matrix = ppm * ic_total[:, np.newaxis]
+
+    return pd.DataFrame(ic_matrix, columns=BASES)
+
+
+def score_sequence_with_pwm(seq, pwm):
     if len(seq) != pwm.shape[0]:
         return -np.inf
     score = 0.0
     for i, base in enumerate(seq.upper()):
         if base in BASE_TO_IDX:
             score += pwm[i, BASE_TO_IDX[base]]
-        else:
-            score += 0  # N or other
     return score
 
 
-def max_pwm_score(pwm: np.ndarray) -> float:
-    """Maximum possible score for a PWM."""
+def max_pwm_score(pwm):
     return float(pwm.max(axis=1).sum())
 
 
-def min_pwm_score(pwm: np.ndarray) -> float:
-    """Minimum possible score for a PWM."""
+def min_pwm_score(pwm):
     return float(pwm.min(axis=1).sum())
 
 
-def reverse_complement_pwm(pwm: np.ndarray) -> np.ndarray:
-    """Reverse complement a PWM. Column order: A,C,G,T → T,G,C,A reversed."""
+def reverse_complement_pwm(pwm):
     return pwm[::-1, ::-1].copy()
 
 
-def scan_sequence(seq: str, pwm: np.ndarray, threshold: float = 0.7) -> List[dict]:
-    """
-    Scan a sequence for PWM matches on both strands.
-
-    Args:
-        seq: DNA sequence
-        pwm: [motif_len, 4] position weight matrix
-        threshold: minimum relative score (0-1) to report
-
-    Returns:
-        List of matches with position, strand, score, rel_score
-    """
+def scan_sequence(seq, pwm, threshold=0.7):
     motif_len = pwm.shape[0]
     if len(seq) < motif_len:
         return []
@@ -177,7 +148,6 @@ def scan_sequence(seq: str, pwm: np.ndarray, threshold: float = 0.7) -> List[dic
     max_s = max_pwm_score(pwm)
     min_s = min_pwm_score(pwm)
     score_range = max_s - min_s if max_s != min_s else 1.0
-
     rc_pwm = reverse_complement_pwm(pwm)
 
     matches = []
@@ -186,90 +156,47 @@ def scan_sequence(seq: str, pwm: np.ndarray, threshold: float = 0.7) -> List[dic
         if "N" in subseq:
             continue
 
-        # Forward strand
-        fwd_score = score_sequence_with_pwm(subseq, pwm)
-        fwd_rel = (fwd_score - min_s) / score_range
-
-        if fwd_rel >= threshold:
-            matches.append({
-                "position": i,
-                "strand": "+",
-                "score": fwd_score,
-                "max_score": max_s,
-                "rel_score": round(fwd_rel, 4),
-                "matched_seq": subseq,
-            })
-
-        # Reverse strand
-        rev_score = score_sequence_with_pwm(subseq, rc_pwm)
-        rev_rel = (rev_score - min_s) / score_range
-
-        if rev_rel >= threshold:
-            matches.append({
-                "position": i,
-                "strand": "-",
-                "score": rev_score,
-                "max_score": max_s,
-                "rel_score": round(rev_rel, 4),
-                "matched_seq": subseq,
-            })
-
+        for strand, p in [("+", pwm), ("-", rc_pwm)]:
+            s = score_sequence_with_pwm(subseq, p)
+            rel = (s - min_s) / score_range
+            if rel >= threshold:
+                matches.append({
+                    "position": i, "strand": strand,
+                    "score": s, "max_score": max_s,
+                    "rel_score": round(rel, 4), "matched_seq": subseq,
+                })
     return matches
 
 
-def compare_pwms(pwm1: np.ndarray, pwm2: np.ndarray) -> dict:
-    """
-    Compare two PWMs using Pearson correlation (like TOMTOM).
-    Tries all offsets and both orientations, returns best match.
-
-    Returns:
-        dict with: pearson_r, offset, orientation, p_value_approx
-    """
+def compare_pwms(pwm1, pwm2):
     from scipy import stats
 
     best = {"pearson_r": -1, "offset": 0, "orientation": "+"}
+    for orient, p2 in [("+", pwm2), ("-", reverse_complement_pwm(pwm2))]:
+        l1, l2 = pwm1.shape[0], p2.shape[0]
+        min_ov = min(5, min(l1, l2))
 
-    for orientation, p2 in [("+", pwm2), ("-", reverse_complement_pwm(pwm2))]:
-        len1, len2 = pwm1.shape[0], p2.shape[0]
-        min_overlap = min(5, min(len1, len2))
-
-        for offset in range(-len2 + min_overlap, len1 - min_overlap + 1):
-            # Overlapping region
-            start1 = max(0, offset)
-            end1 = min(len1, offset + len2)
-            start2 = max(0, -offset)
-            end2 = start2 + (end1 - start1)
-
-            if end1 - start1 < min_overlap:
+        for off in range(-l2 + min_ov, l1 - min_ov + 1):
+            s1, e1 = max(0, off), min(l1, off + l2)
+            s2 = max(0, -off)
+            if e1 - s1 < min_ov:
                 continue
-
-            flat1 = pwm1[start1:end1].flatten()
-            flat2 = p2[start2:end2].flatten()
-
-            if len(flat1) < 4:
+            f1 = pwm1[s1:e1].flatten()
+            f2 = p2[s2:s2 + (e1 - s1)].flatten()
+            if len(f1) < 4:
                 continue
-
-            r, p = stats.pearsonr(flat1, flat2)
-
+            r, p = stats.pearsonr(f1, f2)
             if r > best["pearson_r"]:
-                best = {
-                    "pearson_r": round(r, 4),
-                    "p_value": round(p, 6),
-                    "offset": offset,
-                    "orientation": orientation,
-                    "overlap": end1 - start1,
-                }
-
+                best = {"pearson_r": round(r, 4), "p_value": round(p, 6),
+                        "offset": off, "orientation": orient, "overlap": e1 - s1}
     return best
 
 
 # ---------------------------------------------------------------------------
 # JASPAR database
 # ---------------------------------------------------------------------------
-def download_jaspar() -> list:
-    """Download JASPAR 2024 CORE human motifs via API."""
+def download_jaspar():
     import urllib.request
-
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     if JASPAR_CACHE.exists():
@@ -277,7 +204,6 @@ def download_jaspar() -> list:
             return json.load(f)
 
     print("Downloading JASPAR 2024 CORE human motifs (one-time)...")
-
     all_motifs = []
     url = JASPAR_URL
 
@@ -290,16 +216,12 @@ def download_jaspar() -> list:
             pfm_raw = entry.get("pfm", {})
             if not pfm_raw:
                 continue
-
-            # Convert {A: [...], C: [...], G: [...], T: [...]} to numpy
             length = len(pfm_raw.get("A", []))
             if length == 0:
                 continue
-
             pfm = np.zeros((length, 4))
             for bi, base in enumerate(BASES):
-                vals = pfm_raw.get(base, [0] * length)
-                pfm[:, bi] = vals
+                pfm[:, bi] = pfm_raw.get(base, [0] * length)
 
             all_motifs.append({
                 "matrix_id": entry.get("matrix_id", ""),
@@ -307,12 +229,9 @@ def download_jaspar() -> list:
                 "pfm": pfm.tolist(),
                 "length": length,
                 "family": entry.get("family", []),
-                "uniprot_ids": entry.get("uniprot_ids", []),
             })
-
         url = data.get("next")
 
-    # Cache
     with open(JASPAR_CACHE, "w") as f:
         json.dump(all_motifs, f)
 
@@ -324,28 +243,14 @@ def download_jaspar() -> list:
 # MotifAnalyzer
 # ---------------------------------------------------------------------------
 class MotifAnalyzer:
-    """
-    Motif analysis for DeepVRegulome variants.
 
-    Usage:
-        analyzer = MotifAnalyzer()
-        report = analyzer.analyze_variant(dvr, "ATF4")
-        print(report.disrupted_motifs)
-        analyzer.plot_motif_logo(report)
-    """
-
-    def __init__(self, jaspar_cache: Optional[str] = None):
-        """
-        Args:
-            jaspar_cache: Path to cached JASPAR JSON. If None, uses default cache.
-        """
+    def __init__(self, jaspar_cache=None):
         self._jaspar_raw = None
-        self._motifs = None  # dict: name -> {matrix_id, pwm, ...}
+        self._motifs = None
         self._custom_cache = jaspar_cache
 
     @property
-    def motifs(self) -> dict:
-        """Lazy-load JASPAR motifs."""
+    def motifs(self):
         if self._motifs is None:
             if self._custom_cache and os.path.exists(self._custom_cache):
                 with open(self._custom_cache) as f:
@@ -357,145 +262,57 @@ class MotifAnalyzer:
             for entry in raw:
                 pfm = np.array(entry["pfm"])
                 pwm = pfm_to_pwm(pfm)
-                name = entry["name"]
                 mid = entry["matrix_id"]
-
-                # Store by matrix_id (unique) and also index by name
                 self._motifs[mid] = {
-                    "matrix_id": mid,
-                    "name": name,
-                    "pfm": pfm,
-                    "pwm": pwm,
-                    "length": entry["length"],
+                    "matrix_id": mid, "name": entry["name"],
+                    "pfm": pfm, "pwm": pwm, "length": entry["length"],
                     "family": entry.get("family", []),
                 }
-
             print(f"Loaded {len(self._motifs)} JASPAR motifs")
-
         return self._motifs
 
-    def _find_motifs_by_name(self, tf_name: str) -> List[dict]:
-        """Find all JASPAR motifs matching a TF name (case-insensitive)."""
+    def _find_motifs_by_name(self, tf_name):
         tf_upper = tf_name.upper()
-        matches = []
-        for mid, m in self.motifs.items():
-            if m["name"].upper() == tf_upper:
-                matches.append(m)
-        return matches
+        return [m for m in self.motifs.values() if m["name"].upper() == tf_upper]
 
-    # ------------------------------------------------------------------
-    # Core: scan a sequence for all JASPAR motif matches
-    # ------------------------------------------------------------------
-    def scan_all_motifs(
-        self,
-        sequence: str,
-        threshold: float = 0.75,
-        top_n: int = 50,
-    ) -> List[MotifMatch]:
-        """
-        Scan a sequence against all JASPAR motifs.
-
-        Args:
-            sequence: DNA sequence
-            threshold: minimum relative score to report (0-1)
-            top_n: maximum number of matches to return
-
-        Returns:
-            List of MotifMatch, sorted by score descending
-        """
+    def scan_all_motifs(self, sequence, threshold=0.75, top_n=50):
         all_matches = []
-
-        for mid, motif_data in self.motifs.items():
-            pwm = motif_data["pwm"]
-            hits = scan_sequence(sequence, pwm, threshold=threshold)
-
-            for hit in hits:
+        for mid, md in self.motifs.items():
+            for hit in scan_sequence(sequence, md["pwm"], threshold=threshold):
                 all_matches.append(MotifMatch(
-                    motif_id=mid,
-                    motif_name=motif_data["name"],
-                    position=hit["position"],
-                    strand=hit["strand"],
-                    score=hit["score"],
-                    max_score=hit["max_score"],
-                    rel_score=hit["rel_score"],
-                    matched_seq=hit["matched_seq"],
+                    motif_id=mid, motif_name=md["name"],
+                    position=hit["position"], strand=hit["strand"],
+                    score=hit["score"], max_score=hit["max_score"],
+                    rel_score=hit["rel_score"], matched_seq=hit["matched_seq"],
                 ))
-
-        # Sort by relative score
         all_matches.sort(key=lambda m: -m.rel_score)
         return all_matches[:top_n]
 
-    # ------------------------------------------------------------------
-    # Core: scan for a specific TF's motif
-    # ------------------------------------------------------------------
-    def find_tf_motif(
-        self,
-        sequence: str,
-        tf_name: str,
-        threshold: float = 0.7,
-    ) -> Optional[MotifMatch]:
-        """
-        Check if a specific TF's JASPAR motif is present in the sequence.
-
-        Returns the best match, or None if no match above threshold.
-        """
+    def find_tf_motif(self, sequence, tf_name, threshold=0.7):
         tf_motifs = self._find_motifs_by_name(tf_name)
         if not tf_motifs:
-            return None
+            return None, None
 
         best = None
-        for motif_data in tf_motifs:
-            hits = scan_sequence(sequence, motif_data["pwm"], threshold=threshold)
-            for hit in hits:
+        best_pfm = None
+        best_mid = None
+        for md in tf_motifs:
+            for hit in scan_sequence(sequence, md["pwm"], threshold=threshold):
                 match = MotifMatch(
-                    motif_id=motif_data["matrix_id"],
-                    motif_name=motif_data["name"],
-                    position=hit["position"],
-                    strand=hit["strand"],
-                    score=hit["score"],
-                    max_score=hit["max_score"],
-                    rel_score=hit["rel_score"],
-                    matched_seq=hit["matched_seq"],
+                    motif_id=md["matrix_id"], motif_name=md["name"],
+                    position=hit["position"], strand=hit["strand"],
+                    score=hit["score"], max_score=hit["max_score"],
+                    rel_score=hit["rel_score"], matched_seq=hit["matched_seq"],
                 )
                 if best is None or match.rel_score > best.rel_score:
                     best = match
+                    best_pfm = md["pfm"]
+        return best, best_pfm
 
-        return best
-
-    # ------------------------------------------------------------------
-    # Attention-based motif extraction
-    # ------------------------------------------------------------------
-    def extract_attention_motif(
-        self,
-        dvr,
-        model_name: str,
-        var_idx: int = 0,
-        motif_length: int = 10,
-        top_fraction: float = 0.2,
-    ) -> Tuple[np.ndarray, str]:
-        """
-        Extract a PWM from high-attention positions in the DNABERT model.
-
-        Uses the REF sequence attention: finds the region with highest
-        attention density, extracts the subsequence, and converts to a PWM.
-
-        Args:
-            dvr: DVR instance with attention data
-            model_name: model name
-            var_idx: variant index
-            motif_length: length of motif to extract
-            top_fraction: fraction of positions to consider "high attention"
-
-        Returns:
-            (pwm, consensus_sequence)
-        """
+    def extract_attention_motif(self, dvr, model_name, var_idx=0, motif_length=10):
         data = dvr.get_attention(model_name, var_idx)
         ref_attn = data["ref_attention"]
         ref_seq = data["ref_seq"]
-
-        # Find the region of length motif_length with highest total attention
-        best_start = 0
-        best_score = -1
 
         # Map k-mer attention to nucleotide space
         nuc_attn = np.zeros(len(ref_seq))
@@ -504,160 +321,110 @@ class MotifAnalyzer:
             if center < len(nuc_attn):
                 nuc_attn[center] += ref_attn[ki]
 
+        # Find region with highest attention
+        best_start, best_score = 0, -1
         for i in range(len(ref_seq) - motif_length + 1):
-            region_score = nuc_attn[i:i + motif_length].sum()
-            if region_score > best_score:
-                best_score = region_score
+            s = nuc_attn[i:i + motif_length].sum()
+            if s > best_score:
+                best_score = s
                 best_start = i
 
-        # Extract subsequence
         motif_seq = ref_seq[best_start:best_start + motif_length].upper()
-
-        # Convert to PFM (single sequence → one-hot)
-        pfm = np.zeros((motif_length, 4))
-        for i, base in enumerate(motif_seq):
-            if base in BASE_TO_IDX:
-                pfm[i, BASE_TO_IDX[base]] = 1.0
-
-        # Weight by attention
         attn_weights = nuc_attn[best_start:best_start + motif_length]
         attn_weights = attn_weights / (attn_weights.max() + 1e-8)
 
-        # Create weighted PFM (attention-weighted counts)
-        weighted_pfm = pfm * attn_weights[:, np.newaxis]
+        # Build attention-weighted PFM
+        # For each position, create a distribution biased by the actual base
+        # and spread by (1 - attention_weight) to other bases
+        pfm = np.zeros((motif_length, 4))
+        for i, base in enumerate(motif_seq):
+            if base not in BASE_TO_IDX:
+                pfm[i] = 0.25  # uniform for N
+                continue
+            w = attn_weights[i]
+            # High attention → sharper distribution toward actual base
+            # Low attention → more uniform
+            primary_weight = 0.4 + 0.6 * w  # ranges from 0.4 to 1.0
+            other_weight = (1.0 - primary_weight) / 3.0
+            pfm[i] = other_weight
+            pfm[i, BASE_TO_IDX[base]] = primary_weight
 
-        # Normalize to get PWM
-        pwm = pfm_to_pwm(weighted_pfm + PSEUDO)
+        # Scale to counts (like a PFM with 100 sequences)
+        pfm = pfm * 100
 
-        # Consensus
-        consensus = ""
-        for i in range(motif_length):
-            consensus += BASES[np.argmax(pfm[i])]
+        consensus = "".join(BASES[np.argmax(pfm[i])] for i in range(motif_length))
+        return pfm, consensus
 
-        return weighted_pfm, consensus
-
-    # ------------------------------------------------------------------
-    # Full variant analysis
-    # ------------------------------------------------------------------
-    def analyze_variant(
-        self,
-        dvr,
-        model_name: str,
-        var_idx: int = 0,
-        scan_threshold: float = 0.75,
-        motif_length: int = 10,
-    ) -> MotifReport:
-        """
-        Complete motif analysis for a scored variant.
-
-        Args:
-            dvr: DVR instance (must have been called with return_attention=True)
-            model_name: model name (e.g., "ATF4")
-            var_idx: variant index
-            scan_threshold: PWM match threshold (0-1)
-            motif_length: length for attention-derived motif
-
-        Returns:
-            MotifReport with all analysis results
-        """
+    def analyze_variant(self, dvr, model_name, var_idx=0,
+                        scan_threshold=0.75, motif_length=10):
         data = dvr.get_attention(model_name, var_idx)
         ref_seq = data["ref_seq"]
         alt_seq = data["alt_seq"]
         variant_pos = data.get("variant_pos", len(ref_seq) // 2)
 
-        # Extract window around variant for scanning
         window = 30
-        start = max(0, variant_pos - window)
-        end = min(len(ref_seq), variant_pos + window + 1)
-        ref_window = ref_seq[start:end]
-        alt_window = alt_seq[start:end]
+        s = max(0, variant_pos - window)
+        e = min(len(ref_seq), variant_pos + window + 1)
+        ref_window = ref_seq[s:e]
+        alt_window = alt_seq[s:e]
 
-        # 1. Scan REF and ALT for all JASPAR motifs
+        # 1. Scan JASPAR motifs
         print(f"Scanning ±{window}bp around variant for JASPAR motifs...")
         ref_matches = self.scan_all_motifs(ref_window, threshold=scan_threshold)
         alt_matches = self.scan_all_motifs(alt_window, threshold=scan_threshold)
 
-        # 2. Find disrupted motifs (in REF but not in ALT at same position)
+        # 2. Find disrupted/gained
         ref_set = {(m.motif_id, m.position, m.strand): m for m in ref_matches}
         alt_set = {(m.motif_id, m.position, m.strand): m for m in alt_matches}
 
-        disrupted = []
-        for key, ref_m in ref_set.items():
+        disrupted, gained = [], []
+        for key, rm in ref_set.items():
             if key not in alt_set:
-                disrupted.append({
-                    "motif_id": ref_m.motif_id,
-                    "motif_name": ref_m.motif_name,
-                    "position": ref_m.position,
-                    "strand": ref_m.strand,
-                    "ref_score": ref_m.rel_score,
-                    "alt_score": 0.0,
-                    "score_change": -ref_m.rel_score,
-                    "matched_seq": ref_m.matched_seq,
-                })
+                disrupted.append({"motif_id": rm.motif_id, "motif_name": rm.motif_name,
+                                  "position": rm.position, "strand": rm.strand,
+                                  "ref_score": rm.rel_score, "alt_score": 0.0,
+                                  "score_change": -rm.rel_score, "matched_seq": rm.matched_seq})
             else:
-                alt_m = alt_set[key]
-                if ref_m.rel_score - alt_m.rel_score > 0.1:
-                    disrupted.append({
-                        "motif_id": ref_m.motif_id,
-                        "motif_name": ref_m.motif_name,
-                        "position": ref_m.position,
-                        "strand": ref_m.strand,
-                        "ref_score": ref_m.rel_score,
-                        "alt_score": alt_m.rel_score,
-                        "score_change": alt_m.rel_score - ref_m.rel_score,
-                        "matched_seq": ref_m.matched_seq,
-                    })
+                am = alt_set[key]
+                if rm.rel_score - am.rel_score > 0.1:
+                    disrupted.append({"motif_id": rm.motif_id, "motif_name": rm.motif_name,
+                                      "position": rm.position, "strand": rm.strand,
+                                      "ref_score": rm.rel_score, "alt_score": am.rel_score,
+                                      "score_change": am.rel_score - rm.rel_score,
+                                      "matched_seq": rm.matched_seq})
 
-        gained = []
-        for key, alt_m in alt_set.items():
+        for key, am in alt_set.items():
             if key not in ref_set:
-                gained.append({
-                    "motif_id": alt_m.motif_id,
-                    "motif_name": alt_m.motif_name,
-                    "position": alt_m.position,
-                    "strand": alt_m.strand,
-                    "ref_score": 0.0,
-                    "alt_score": alt_m.rel_score,
-                    "score_change": alt_m.rel_score,
-                    "matched_seq": alt_m.matched_seq,
-                })
+                gained.append({"motif_id": am.motif_id, "motif_name": am.motif_name,
+                               "position": am.position, "strand": am.strand,
+                               "ref_score": 0.0, "alt_score": am.rel_score,
+                               "score_change": am.rel_score, "matched_seq": am.matched_seq})
 
         disrupted_df = pd.DataFrame(disrupted).sort_values("score_change") if disrupted else pd.DataFrame()
         gained_df = pd.DataFrame(gained).sort_values("score_change", ascending=False) if gained else pd.DataFrame()
 
-        # 3. Check TF's own motif
-        tf_ref = self.find_tf_motif(ref_window, model_name, threshold=0.6)
-        tf_alt = self.find_tf_motif(alt_window, model_name, threshold=0.6)
+        # 3. TF's own motif
+        tf_ref, tf_pfm = self.find_tf_motif(ref_window, model_name, threshold=0.6)
+        tf_alt, _ = self.find_tf_motif(alt_window, model_name, threshold=0.6)
         tf_disrupted = (tf_ref is not None and tf_alt is None) or \
                        (tf_ref is not None and tf_alt is not None and
                         tf_ref.rel_score - tf_alt.rel_score > 0.1)
 
-        # 4. Extract attention-based motif
-        learned_pwm, consensus = self.extract_attention_motif(
-            dvr, model_name, var_idx, motif_length=motif_length
-        )
+        # 4. Attention-derived motif
+        learned_pfm, consensus = self.extract_attention_motif(dvr, model_name, var_idx, motif_length)
 
         # 5. Compare learned motif to JASPAR
-        learned_jaspar_match = None
-        if learned_pwm is not None:
-            learned_pwm_logodds = pfm_to_pwm(learned_pwm + PSEUDO)
-            best_r = -1
-            best_match = None
-
-            for mid, motif_data in self.motifs.items():
-                try:
-                    result = compare_pwms(learned_pwm_logodds, motif_data["pwm"])
-                    if result["pearson_r"] > best_r:
-                        best_r = result["pearson_r"]
-                        best_match = {
-                            "matrix_id": mid,
-                            "name": motif_data["name"],
-                            **result,
-                        }
-                except Exception:
-                    continue
-
-            learned_jaspar_match = best_match
+        learned_pwm = pfm_to_pwm(learned_pfm)
+        best_r, best_match, best_jaspar_pfm = -1, None, None
+        for mid, md in self.motifs.items():
+            try:
+                result = compare_pwms(learned_pwm, md["pwm"])
+                if result["pearson_r"] > best_r:
+                    best_r = result["pearson_r"]
+                    best_match = {"matrix_id": mid, "name": md["name"], **result}
+                    best_jaspar_pfm = md["pfm"]
+            except Exception:
+                continue
 
         # Build report
         report = MotifReport(
@@ -666,22 +433,20 @@ class MotifAnalyzer:
             genomic_pos=data.get("genomic_pos", 0),
             ref_allele=ref_seq[variant_pos] if variant_pos < len(ref_seq) else "",
             alt_allele=alt_seq[variant_pos] if variant_pos < len(alt_seq) else "",
-            prob_ref=data["prob_ref"],
-            prob_alt=data["prob_alt"],
-            log_odds_ratio=0,  # computed externally
-            ref_matches=ref_matches,
-            alt_matches=alt_matches,
-            disrupted_motifs=disrupted_df,
-            gained_motifs=gained_df,
-            tf_own_motif_ref=tf_ref,
-            tf_own_motif_alt=tf_alt,
+            prob_ref=data["prob_ref"], prob_alt=data["prob_alt"],
+            log_odds_ratio=0,
+            ref_matches=ref_matches, alt_matches=alt_matches,
+            disrupted_motifs=disrupted_df, gained_motifs=gained_df,
+            tf_own_motif_ref=tf_ref, tf_own_motif_alt=tf_alt,
             tf_motif_disrupted=tf_disrupted,
-            learned_pwm=learned_pwm,
+            tf_jaspar_pfm=tf_pfm,
+            tf_jaspar_id=tf_ref.motif_id if tf_ref else "",
+            tf_jaspar_name=model_name,
+            learned_pfm=learned_pfm,
             learned_consensus=consensus,
-            learned_jaspar_match=learned_jaspar_match,
-            ref_seq=ref_seq,
-            alt_seq=alt_seq,
-            variant_pos=variant_pos,
+            learned_jaspar_match=best_match,
+            learned_jaspar_pfm=best_jaspar_pfm,
+            ref_seq=ref_seq, alt_seq=alt_seq, variant_pos=variant_pos,
         )
 
         # Print summary
@@ -690,207 +455,201 @@ class MotifAnalyzer:
         print(f"{'='*60}")
         print(f"  Variant: {report.ref_allele} → {report.alt_allele}")
         print(f"  P(binding): {report.prob_ref:.4f} → {report.prob_alt:.4f}")
-        print(f"  JASPAR motifs in REF window: {len(ref_matches)}")
-        print(f"  JASPAR motifs in ALT window: {len(alt_matches)}")
-        print(f"  Disrupted motifs: {len(disrupted_df)}")
-        print(f"  Gained motifs: {len(gained_df)}")
+        print(f"  JASPAR motifs in REF: {len(ref_matches)}")
+        print(f"  JASPAR motifs in ALT: {len(alt_matches)}")
+        print(f"  Disrupted: {len(disrupted_df)}  |  Gained: {len(gained_df)}")
 
         if tf_ref:
             print(f"  {model_name}'s own motif ({tf_ref.motif_id}): "
-                  f"{'DISRUPTED' if tf_disrupted else 'intact'} "
+                  f"{'⚠ DISRUPTED' if tf_disrupted else '✓ intact'} "
                   f"(REF={tf_ref.rel_score:.3f}"
-                  f"{', ALT=' + str(tf_alt.rel_score) if tf_alt else ', absent in ALT'})")
+                  f"{', ALT=' + f'{tf_alt.rel_score:.3f}' if tf_alt else ', absent in ALT'})")
         else:
             print(f"  {model_name}'s own motif: not found in JASPAR")
 
-        if learned_jaspar_match:
-            lm = learned_jaspar_match
-            print(f"  Attention-derived motif: {consensus}")
-            print(f"    Best JASPAR match: {lm['name']} ({lm['matrix_id']}) "
-                  f"r={lm['pearson_r']:.3f} p={lm.get('p_value', 'N/A')}")
-
+        if best_match:
+            print(f"  Attention motif: {consensus}")
+            print(f"    Best JASPAR match: {best_match['name']} ({best_match['matrix_id']}) "
+                  f"r={best_match['pearson_r']:.3f}")
         print(f"{'='*60}\n")
 
         return report
 
     # ------------------------------------------------------------------
-    # Visualization: Motif Logo
+    # Visualization: Proper PWM logos
     # ------------------------------------------------------------------
-    def plot_motif_logo(
-        self,
-        report: MotifReport,
-        figsize: Tuple[int, int] = (12, 4),
-        save_path: Optional[str] = None,
-    ):
+    def plot_motif_logo(self, report, figsize=(14, 6), save_path=None):
         """
-        Plot web logos for REF and ALT sequences at the variant site,
-        weighted by attention.
+        Plot JASPAR motif PWM logo and attention-derived motif logo.
 
-        Requires: pip install logomaker
+        Top: JASPAR known motif (from the TF's own entry or best match)
+        Bottom: DeepVRegulome attention-derived motif
+        Both are proper PWM logos with letter heights = information content.
         """
         try:
             import logomaker
             import matplotlib.pyplot as plt
         except ImportError:
-            raise ImportError(
-                "logomaker and matplotlib required for logo plots. "
-                "Install with: pip install deepvregulome[interpret]"
-            )
+            raise ImportError("logomaker and matplotlib required. "
+                              "pip install logomaker matplotlib")
 
-        variant_pos = report.variant_pos
-        window = 10
+        # Determine which JASPAR PFM to show
+        jaspar_pfm = None
+        jaspar_label = ""
 
-        start = max(0, variant_pos - window)
-        end = min(len(report.ref_seq), variant_pos + window + 1)
+        if report.tf_jaspar_pfm is not None:
+            jaspar_pfm = report.tf_jaspar_pfm
+            jaspar_label = f"JASPAR: {report.tf_jaspar_name} ({report.tf_jaspar_id})"
+        elif report.learned_jaspar_pfm is not None and report.learned_jaspar_match:
+            jaspar_pfm = report.learned_jaspar_pfm
+            lm = report.learned_jaspar_match
+            jaspar_label = (f"JASPAR best match: {lm['name']} ({lm['matrix_id']}) "
+                           f"| r={lm['pearson_r']:.3f}")
 
-        ref_region = report.ref_seq[start:end].upper()
-        alt_region = report.alt_seq[start:end].upper()
+        has_jaspar = jaspar_pfm is not None
+        has_learned = report.learned_pfm is not None
+        n_panels = (1 if has_jaspar else 0) + (1 if has_learned else 0)
 
-        # Create information content matrices
-        def seq_to_ic_matrix(seq):
-            """Convert sequence to information content matrix for logomaker."""
-            mat = np.zeros((len(seq), 4))
-            for i, base in enumerate(seq):
-                if base in BASE_TO_IDX:
-                    mat[i, BASE_TO_IDX[base]] = 2.0  # max IC = 2 bits
-            df = pd.DataFrame(mat, columns=["A", "C", "G", "T"])
-            return df
+        if n_panels == 0:
+            print("No motif data available for logo plot.")
+            return None
 
-        ref_df = seq_to_ic_matrix(ref_region)
-        alt_df = seq_to_ic_matrix(alt_region)
+        fig, axes = plt.subplots(n_panels, 1, figsize=figsize)
+        if n_panels == 1:
+            axes = [axes]
 
-        fig, axes = plt.subplots(2, 1, figsize=figsize)
+        panel_idx = 0
 
-        # REF logo
-        logomaker.Logo(ref_df, ax=axes[0], color_scheme="classic")
-        axes[0].set_title(
-            f"REF — {report.model_name} | P(binding)={report.prob_ref:.4f}",
-            fontsize=11
-        )
-        axes[0].set_ylabel("Bits")
+        # Panel 1: JASPAR motif logo
+        if has_jaspar:
+            ic_df = pfm_to_ic(jaspar_pfm)
+            logomaker.Logo(ic_df, ax=axes[panel_idx], color_scheme="classic")
+            axes[panel_idx].set_title(jaspar_label, fontsize=12, fontweight="bold")
+            axes[panel_idx].set_ylabel("IC (bits)")
+            axes[panel_idx].set_ylim(0, 2.2)
+            panel_idx += 1
 
-        # Highlight variant
-        vp = variant_pos - start
-        axes[0].axvspan(vp - 0.5, vp + 0.5, alpha=0.2, color="red")
+        # Panel 2: Attention-derived motif logo
+        if has_learned:
+            ic_df = pfm_to_ic(report.learned_pfm)
+            logomaker.Logo(ic_df, ax=axes[panel_idx], color_scheme="classic")
 
-        # ALT logo
-        logomaker.Logo(alt_df, ax=axes[1], color_scheme="classic")
-        axes[1].set_title(
-            f"ALT — {report.model_name} | P(binding)={report.prob_alt:.4f}",
-            fontsize=11
-        )
-        axes[1].set_ylabel("Bits")
-        axes[1].axvspan(vp - 0.5, vp + 0.5, alpha=0.2, color="red")
+            title = f"DeepVRegulome learned motif: {report.learned_consensus}"
+            if report.learned_jaspar_match:
+                lm = report.learned_jaspar_match
+                title += f"  |  Match: {lm['name']} (r={lm['pearson_r']:.3f})"
+            axes[panel_idx].set_title(title, fontsize=12, fontweight="bold")
+            axes[panel_idx].set_ylabel("IC (bits)")
+            axes[panel_idx].set_ylim(0, 2.2)
 
         fig.suptitle(
-            f"Motif Logo: {report.chrom}:{report.genomic_pos} "
-            f"{report.ref_allele}>{report.alt_allele}  ±{window}bp",
-            fontsize=13, fontweight="bold"
+            f"Motif Analysis: {report.model_name} at "
+            f"{report.chrom}:{report.genomic_pos} "
+            f"{report.ref_allele}>{report.alt_allele}  |  "
+            f"P(ref)={report.prob_ref:.4f} → P(alt)={report.prob_alt:.4f}",
+            fontsize=13, fontweight="bold", y=1.02,
         )
-
         plt.tight_layout()
 
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
             print(f"Saved to {save_path}")
+        return fig
 
+    def plot_jaspar_motif(self, motif_id, figsize=(10, 3), save_path=None):
+        """
+        Plot a single JASPAR motif logo by matrix ID.
+
+        Usage:
+            analyzer.plot_jaspar_motif("MA0833.3")
+        """
+        try:
+            import logomaker
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError("logomaker required. pip install logomaker")
+
+        if motif_id not in self.motifs:
+            raise KeyError(f"Motif {motif_id} not found in JASPAR database")
+
+        md = self.motifs[motif_id]
+        ic_df = pfm_to_ic(md["pfm"])
+
+        fig, ax = plt.subplots(figsize=figsize)
+        logomaker.Logo(ic_df, ax=ax, color_scheme="classic")
+        ax.set_title(f"{md['name']} ({motif_id})", fontsize=13, fontweight="bold")
+        ax.set_ylabel("IC (bits)")
+        ax.set_ylim(0, 2.2)
+        plt.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
         return fig
 
     # ------------------------------------------------------------------
-    # Visualization: Full Variant Report
+    # Full variant report
     # ------------------------------------------------------------------
-    def plot_variant_report(
-        self,
-        report: MotifReport,
-        dvr=None,
-        figsize: Tuple[int, int] = (16, 12),
-        save_path: Optional[str] = None,
-    ):
+    def plot_variant_report(self, report, dvr=None, figsize=(16, 14), save_path=None):
         """
-        Combined figure: attention + motif + disruption in one panel.
-
-        Panel 1: Sequence attention (nucleotide-colored boxes)
-        Panel 2: Disrupted motifs table
-        Panel 3: Attention-derived motif logo + best JASPAR match
+        Combined figure:
+            Row 1: Sequence with attention coloring (REF and ALT)
+            Row 2: Disrupted motifs table + TF status
+            Row 3: JASPAR motif logo (top) + Learned motif logo (bottom)
         """
         try:
+            import logomaker
             import matplotlib.pyplot as plt
-            import matplotlib.patches as mpatches
         except ImportError:
-            raise ImportError("matplotlib required. pip install matplotlib")
+            raise ImportError("logomaker and matplotlib required.")
 
         fig = plt.figure(figsize=figsize)
-        gs = fig.add_gridspec(3, 2, height_ratios=[1.5, 1, 1.5], hspace=0.4, wspace=0.3)
+        gs = fig.add_gridspec(4, 2, height_ratios=[1.2, 1, 1.5, 1.5], hspace=0.5, wspace=0.3)
 
-        variant_pos = report.variant_pos
+        vp = report.variant_pos
         window = 15
-        start = max(0, variant_pos - window)
-        end = min(len(report.ref_seq), variant_pos + window + 1)
+        s = max(0, vp - window)
+        e = min(len(report.ref_seq), vp + window + 1)
+        ref_region = report.ref_seq[s:e]
+        alt_region = report.alt_seq[s:e]
+        vw = vp - s
 
-        ref_region = report.ref_seq[start:end]
-        alt_region = report.alt_seq[start:end]
-        vp_in_win = variant_pos - start
-
-        # --- Panel 1: Sequence with colored nucleotides (top, full width) ---
+        # --- Row 1: Sequence boxes ---
         ax_seq = fig.add_subplot(gs[0, :])
-        cmap = plt.cm.YlGnBu
-
-        # Simple attention coloring (uniform for now, will use real attention if dvr provided)
         n = len(ref_region)
         ax_seq.set_xlim(-0.5, n - 0.5)
         ax_seq.set_ylim(-0.5, 1.5)
 
-        # REF row (top)
         for i, base in enumerate(ref_region):
-            color = "#d4e6f1" if i != vp_in_win else "#f1948a"
-            rect = plt.Rectangle((i - 0.45, 0.6), 0.9, 0.7,
-                                  facecolor=color, edgecolor="gray", linewidth=0.5)
+            c = "#f1948a" if i == vw else "#d4e6f1"
+            rect = plt.Rectangle((i-0.45, 0.6), 0.9, 0.7, facecolor=c, edgecolor="gray", lw=0.5)
             ax_seq.add_patch(rect)
-            ax_seq.text(i, 0.95, base, ha="center", va="center",
-                        fontsize=9, fontweight="bold")
+            ax_seq.text(i, 0.95, base, ha="center", va="center", fontsize=9, fontweight="bold")
 
-        # ALT row (bottom)
         for i, base in enumerate(alt_region):
-            color = "#fadbd8" if i != vp_in_win else "#e74c3c"
-            rect = plt.Rectangle((i - 0.45, -0.2), 0.9, 0.7,
-                                  facecolor=color, edgecolor="gray", linewidth=0.5)
+            c = "#e74c3c" if i == vw else "#fadbd8"
+            fc = "white" if i == vw else "black"
+            rect = plt.Rectangle((i-0.45, -0.2), 0.9, 0.7, facecolor=c, edgecolor="gray", lw=0.5)
             ax_seq.add_patch(rect)
-            fontcolor = "white" if i == vp_in_win else "black"
-            ax_seq.text(i, 0.15, base, ha="center", va="center",
-                        fontsize=9, fontweight="bold", color=fontcolor)
+            ax_seq.text(i, 0.15, base, ha="center", va="center", fontsize=9, fontweight="bold", color=fc)
 
         ax_seq.text(-1.5, 0.95, "REF", ha="right", va="center", fontsize=10, fontweight="bold")
         ax_seq.text(-1.5, 0.15, "ALT", ha="right", va="center", fontsize=10, fontweight="bold")
-        ax_seq.set_title(
-            f"{report.model_name} at {report.chrom}:{report.genomic_pos} "
-            f"({report.ref_allele}→{report.alt_allele})  |  "
-            f"P(ref)={report.prob_ref:.4f} → P(alt)={report.prob_alt:.4f}",
-            fontsize=12, fontweight="bold"
-        )
+        ax_seq.set_title(f"{report.model_name} at {report.chrom}:{report.genomic_pos} "
+                         f"({report.ref_allele}→{report.alt_allele})  |  "
+                         f"P(ref)={report.prob_ref:.4f} → P(alt)={report.prob_alt:.4f}",
+                         fontsize=12, fontweight="bold")
         ax_seq.axis("off")
 
-        # --- Panel 2: Disrupted motifs (bottom-left) ---
+        # --- Row 2 left: Disrupted motifs table ---
         ax_table = fig.add_subplot(gs[1, 0])
         ax_table.axis("off")
-
         if len(report.disrupted_motifs) > 0:
-            top_disrupted = report.disrupted_motifs.head(8)
-            table_data = []
-            for _, row in top_disrupted.iterrows():
-                table_data.append([
-                    row["motif_name"],
-                    row["motif_id"],
-                    f"{row['ref_score']:.3f}",
-                    f"{row['alt_score']:.3f}",
-                    f"{row['score_change']:.3f}",
-                ])
-
-            table = ax_table.table(
-                cellText=table_data,
-                colLabels=["Motif", "ID", "REF", "ALT", "Δ"],
-                loc="center",
-                cellLoc="center",
-            )
+            td = [[r["motif_name"], r["motif_id"], f"{r['ref_score']:.3f}",
+                    f"{r['alt_score']:.3f}", f"{r['score_change']:.3f}"]
+                   for _, r in report.disrupted_motifs.head(6).iterrows()]
+            table = ax_table.table(cellText=td,
+                                    colLabels=["Motif", "ID", "REF", "ALT", "Δ"],
+                                    loc="center", cellLoc="center")
             table.auto_set_font_size(False)
             table.set_fontsize(8)
             table.scale(1, 1.3)
@@ -898,69 +657,53 @@ class MotifAnalyzer:
         else:
             ax_table.text(0.5, 0.5, "No disrupted motifs found",
                           ha="center", va="center", fontsize=11, style="italic")
-            ax_table.set_title("Disrupted JASPAR Motifs", fontsize=11, fontweight="bold")
 
-        # --- Panel 3: TF's own motif status (bottom-right) ---
+        # --- Row 2 right: TF status ---
         ax_tf = fig.add_subplot(gs[1, 1])
         ax_tf.axis("off")
-
-        tf_text = f"TF: {report.model_name}\n\n"
+        txt = f"TF: {report.model_name}\n\n"
         if report.tf_own_motif_ref:
-            tf_text += f"JASPAR motif: {report.tf_own_motif_ref.motif_id}\n"
-            tf_text += f"REF score: {report.tf_own_motif_ref.rel_score:.3f}\n"
-            if report.tf_own_motif_alt:
-                tf_text += f"ALT score: {report.tf_own_motif_alt.rel_score:.3f}\n"
-            else:
-                tf_text += "ALT: motif absent\n"
-            tf_text += f"\nStatus: {'⚠ DISRUPTED' if report.tf_motif_disrupted else '✓ Intact'}"
+            txt += f"JASPAR motif: {report.tf_own_motif_ref.motif_id}\n"
+            txt += f"REF score: {report.tf_own_motif_ref.rel_score:.3f}\n"
+            txt += f"ALT score: {report.tf_own_motif_alt.rel_score:.3f}\n" if report.tf_own_motif_alt else "ALT: absent\n"
+            txt += f"\n{'⚠ DISRUPTED' if report.tf_motif_disrupted else '✓ Intact'}"
         else:
-            tf_text += "Own motif not found in JASPAR\n"
+            txt += "Own motif not in JASPAR\n"
             if report.learned_jaspar_match:
                 lm = report.learned_jaspar_match
-                tf_text += f"\nAttention motif: {report.learned_consensus}\n"
-                tf_text += f"Best match: {lm['name']} ({lm['matrix_id']})\n"
-                tf_text += f"Pearson r = {lm['pearson_r']:.3f}"
-
-        ax_tf.text(0.5, 0.5, tf_text, ha="center", va="center",
-                   fontsize=10, family="monospace",
+                txt += f"\nAttention motif: {report.learned_consensus}\n"
+                txt += f"Best match: {lm['name']} ({lm['matrix_id']})\nr={lm['pearson_r']:.3f}"
+        ax_tf.text(0.5, 0.5, txt, ha="center", va="center", fontsize=10, family="monospace",
                    bbox=dict(boxstyle="round,pad=0.5", facecolor="#eaf2f8", edgecolor="#aed6f1"))
         ax_tf.set_title(f"{report.model_name} Motif Status", fontsize=11, fontweight="bold")
 
-        # --- Panel 4: Learned motif logo (bottom, full width) ---
-        if report.learned_pwm is not None:
-            try:
-                import logomaker
-                ax_logo = fig.add_subplot(gs[2, :])
+        # --- Row 3: JASPAR motif logo ---
+        jaspar_pfm = report.tf_jaspar_pfm or report.learned_jaspar_pfm
+        if jaspar_pfm is not None:
+            ax_jaspar = fig.add_subplot(gs[2, :])
+            ic_df = pfm_to_ic(jaspar_pfm)
+            logomaker.Logo(ic_df, ax=ax_jaspar, color_scheme="classic")
+            if report.tf_jaspar_pfm is not None:
+                ax_jaspar.set_title(f"JASPAR: {report.tf_jaspar_name} ({report.tf_jaspar_id})",
+                                    fontsize=11, fontweight="bold")
+            elif report.learned_jaspar_match:
+                lm = report.learned_jaspar_match
+                ax_jaspar.set_title(f"JASPAR best match: {lm['name']} ({lm['matrix_id']}) | r={lm['pearson_r']:.3f}",
+                                    fontsize=11, fontweight="bold")
+            ax_jaspar.set_ylabel("IC (bits)")
+            ax_jaspar.set_ylim(0, 2.2)
 
-                pwm_df = pd.DataFrame(
-                    report.learned_pwm,
-                    columns=["A", "C", "G", "T"]
-                )
-                # Normalize for logo
-                row_sums = pwm_df.sum(axis=1)
-                row_sums[row_sums == 0] = 1
-                pwm_norm = pwm_df.div(row_sums, axis=0)
-
-                # Information content
-                ic = pwm_norm.copy()
-                for col in ic.columns:
-                    ic[col] = pwm_norm[col] * np.log2(pwm_norm[col] / 0.25 + 1e-10)
-                ic = ic.clip(lower=0)
-
-                logomaker.Logo(ic, ax=ax_logo, color_scheme="classic")
-                ax_logo.set_title(
-                    f"Attention-Derived Motif: {report.learned_consensus}"
-                    + (f"  |  Best JASPAR match: {report.learned_jaspar_match['name']} "
-                       f"(r={report.learned_jaspar_match['pearson_r']:.3f})"
-                       if report.learned_jaspar_match else ""),
-                    fontsize=11, fontweight="bold"
-                )
-                ax_logo.set_ylabel("IC (bits)")
-            except ImportError:
-                pass
+        # --- Row 4: Learned motif logo ---
+        if report.learned_pfm is not None:
+            ax_learned = fig.add_subplot(gs[3, :])
+            ic_df = pfm_to_ic(report.learned_pfm)
+            logomaker.Logo(ic_df, ax=ax_learned, color_scheme="classic")
+            title = f"DeepVRegulome learned motif: {report.learned_consensus}"
+            ax_learned.set_title(title, fontsize=11, fontweight="bold")
+            ax_learned.set_ylabel("IC (bits)")
+            ax_learned.set_ylim(0, 2.2)
 
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
             print(f"Saved to {save_path}")
-
         return fig
