@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deepvregulome"
-version = "0.1.5"
+version = "0.1.8"
 description = "DNABERT-based framework for predicting the functional impact of regulatory variants"
 readme = "README.md"
 license = {text = "CC-BY-NC-4.0"}

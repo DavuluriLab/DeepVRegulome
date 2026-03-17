@@ -11,7 +11,7 @@ Usage:
     report = analyzer.analyze_variant(dvr, "CTCFL")
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.8"
 
 from deepvregulome.registry import ModelRegistry
 
