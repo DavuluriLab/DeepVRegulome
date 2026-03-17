@@ -3,13 +3,15 @@ DeepVRegulome: DNABERT-based regulatory variant effect prediction.
 
 Usage:
     from deepvregulome import DVR
+    dvr = DVR(genome="hg38.fa")
+    result = dvr.score_variant("chr1", 3456782, "A", "C", models=["CTCFL"])
 
-    dvr = DVR(genome="/path/to/hg38.fa")
-    result = dvr.score_variant("chr1", 3456782, "A", "C", models=["CTCFL", "SP1"])
-    results = dvr.score_vcf("variants.vcf", model_type="TF", batch_size=100, gpus=[0,1,2,3])
+    from deepvregulome.interpret import MotifAnalyzer
+    analyzer = MotifAnalyzer()
+    report = analyzer.analyze_variant(dvr, "CTCFL")
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 from deepvregulome.registry import ModelRegistry
 
@@ -18,7 +20,10 @@ def __getattr__(name):
     if name == "DVR":
         from deepvregulome.dvr import DVR
         return DVR
+    if name == "MotifAnalyzer":
+        from deepvregulome.interpret import MotifAnalyzer
+        return MotifAnalyzer
     raise AttributeError(f"module 'deepvregulome' has no attribute {name}")
 
 
-__all__ = ["DVR", "ModelRegistry", "__version__"]
+__all__ = ["DVR", "ModelRegistry", "MotifAnalyzer", "__version__"]
