@@ -150,7 +150,7 @@ import pandas as pd
 # Create a DataFrame of variants to score
 variant_df = pd.read_csv("test_vcf.tsv", sep="\t")
 
-results = dvr_0based.score_variants(
+results = dvr.score_variants(
     variant_df,
     models=["CTCFL", "SP1", "ATF4"],
     batch_size=5,
