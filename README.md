@@ -63,29 +63,6 @@ pip install deepvregulome[interpret]     # installs logomaker, scipy
 pip install deepvregulome[all]
 ```
 
-### 3. System-level dependencies
-
-Some optional dependencies require system libraries that cannot be installed via pip:
-
-```bash
-# pysam requires htslib headers (for genome FASTA indexing)
-# On Ubuntu/Debian:
-sudo apt-get install libhtslib-dev tabix
-
-# On macOS:
-brew install htslib
-
-# cyvcf2 requires libdeflate and htslib
-# On Ubuntu/Debian:
-sudo apt-get install libdeflate-dev
-
-# pybedtools requires BEDTools
-# On Ubuntu/Debian:
-sudo apt-get install bedtools
-
-# On macOS:
-brew install bedtools
-```
 
 ---
 
@@ -261,12 +238,7 @@ jupyter lab notebooks/
 An interactive dashboard for exploring variant predictions and clinical stratification is available:
 
 - **Live demo:** [https://deepvregulome.streamlit.app](https://deepvregulome.streamlit.app)
-- **Run locally:**
 
-```bash
-pip install streamlit plotly lifelines streamlit-aggrid
-streamlit run streamlit_app/app_variant_clinical_dashboard.py
-```
 
 ---
 
@@ -343,7 +315,6 @@ CC-BY-NC-4.0. See [LICENSE](LICENSE) for details.
 ---
 
 <p align="center">
-  <b>Davuluri Lab</b> · Department of Biomedical Informatics · Stony Brook University<br>
+  <b><a href="https://davulurilab.github.io/">Davuluri Lab</a></b> · Department of Biomedical Informatics · Stony Brook University<br>
   <a href="https://github.com/DavuluriLab">GitHub</a> ·
-  <a href="mailto:pratik.dutta@stonybrook.edu">Contact</a>
 </p>
