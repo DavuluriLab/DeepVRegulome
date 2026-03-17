@@ -22,7 +22,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Programming Language :: Python :: 3",
 ]
-
 dependencies = [
     "torch>=1.10",
     "transformers>=4.20",
@@ -36,7 +35,8 @@ dependencies = [
 genome = ["pysam>=0.20"]
 viz = ["matplotlib>=3.5", "seaborn>=0.12"]
 vcf = ["cyvcf2>=0.30"]
-all = ["pysam>=0.20", "matplotlib>=3.5", "seaborn>=0.12", "cyvcf2>=0.30"]
+interpret = ["logomaker>=0.8", "scipy>=1.7"]
+all = ["pysam>=0.20", "matplotlib>=3.5", "seaborn>=0.12", "cyvcf2>=0.30", "logomaker>=0.8", "scipy>=1.7"]
 
 [project.urls]
 Homepage = "https://github.com/DavuluriLab/DeepVRegulome"
@@ -49,6 +49,3 @@ deepvregulome = "deepvregulome.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-interpret = ["logomaker>=0.8", "scipy>=1.7"]
-all = ["pysam>=0.20", "matplotlib>=3.5", "seaborn>=0.12", "cyvcf2>=0.30", "logomaker>=0.8", "scipy>=1.7"]
