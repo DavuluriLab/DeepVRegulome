@@ -36,7 +36,7 @@
 
 ### Requirements
 
-- **Python ≥ 3.11
+- **Python ≥ 3.11**
 - **GPU recommended** — DNABERT inference runs on CPU but is significantly faster on CUDA-enabled GPUs
 
 
