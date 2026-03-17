@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deepvregulome"
-version = "0.1.4"
+version = "0.1.5"
 description = "DNABERT-based framework for predicting the functional impact of regulatory variants"
 readme = "README.md"
 license = {text = "CC-BY-NC-4.0"}
@@ -49,3 +49,6 @@ deepvregulome = "deepvregulome.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+interpret = ["logomaker>=0.8", "scipy>=1.7"]
+all = ["pysam>=0.20", "matplotlib>=3.5", "seaborn>=0.12", "cyvcf2>=0.30", "logomaker>=0.8", "scipy>=1.7"]
