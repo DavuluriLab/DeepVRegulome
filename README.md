@@ -267,7 +267,7 @@ model = AutoModelForSequenceClassification.from_pretrained(
 
 ## Roadmap
 
-**Current capabilities (v0.1.x):**
+**Current capabilities (v0.1.8):**
 - Single-variant and batch VCF scoring with 462 ENCODE ChIP-seq models
 - Multi-GPU inference support
 - Attention-based interpretability
@@ -275,14 +275,11 @@ model = AutoModelForSequenceClassification.from_pretrained(
 
 **In development:**
 - Splice-site disruption scoring (acceptor + donor models)
-- BED file intersection utilities for TFBS overlap analysis
 - JASPAR motif enrichment integration
-- Population-level variant effect analysis (1000 Genomes compatibility)
 - Expanded model zoo: additional cell types and epigenomic marks
 - Conda package
 
 **Planned:**
-- Docker container with pre-installed genome and models
 - REST API for web-based scoring
 - Integration with ClinVar and gnomAD annotation
 
