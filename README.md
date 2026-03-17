@@ -133,6 +133,29 @@ results = dvr.score_vcf(
 )
 results.head()
 ```
+###  Batch Scoring from DataFrame (`score_variants`)
+
+Auto-detects column names: `chrom/pos/ref/alt` or `CHROM/start/end/REF/ALT`.
+
+```python
+import pandas as pd
+
+# VCF-style DataFrame
+# variant_df = pd.DataFrame({
+#     "chrom": ["chr21", "chr1", "chr17", "chr12", "chr7"],
+#     "pos":   [10448027, 3456782, 7674220, 25245350, 55181378],
+#     "ref":   ["C", "A", "C", "G", "T"],
+#     "alt":   ["T", "C", "T", "A", "C"],
+# })
+# Create a DataFrame of variants to score
+variant_df = pd.read_csv("test_vcf.tsv", sep="\t")
+
+results = dvr_0based.score_variants(
+    variant_df,
+    models=["CTCFL", "SP1", "ATF4"],
+    batch_size=5,
+)
+```
 
 ### Score pre-extracted sequences
 
