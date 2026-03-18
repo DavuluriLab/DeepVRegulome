@@ -73,7 +73,25 @@ pip install deepvregulome[interpret]     # installs logomaker, scipy
 # Install everything
 pip install deepvregulome[all]
 ```
+### Recommended: Use a dedicated conda environment
 
+If you're on a shared server (e.g., HPC, JupyterHub), we strongly recommend creating
+a dedicated conda environment to avoid dependency conflicts:
+
+```bash
+# Create and activate environment
+conda create -n dvr python=3.11 -y
+conda activate dvr
+
+# Install deepvregulome with all optional dependencies
+pip install deepvregulome[all]
+
+# If using JupyterHub, register as a selectable kernel
+pip install jupyterlab ipykernel
+python -m ipykernel install --user --name dvr --display-name "DVR (Python 3.11)"
+```
+
+Then select **"DVR (Python 3.11)"** as your kernel in JupyterHub (Kernel → Change Kernel).
 
 ---
 
