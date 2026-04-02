@@ -136,7 +136,10 @@ wget https://jaspar.elixir.no/download/data/2024/CORE/JASPAR2024_CORE_vertebrate
 from deepvregulome import DVR
 
 # Initialize with path to your reference genome FASTA
-dvr = DVR(genome="/path/to/hg38.fa")
+dvr = DVR(
+    genome="/path/to/hg38.fa",
+    model_dir="/path/to/preferred_models",
+)
 
 # Score a variant against specific TF models
 result = dvr.score_variant(
@@ -144,10 +147,23 @@ result = dvr.score_variant(
     pos=3456782,
     ref="A",
     alt="C",
-    models=["CTCFL", "SP1", "MYC"]
+    models=["CTCFL", "SP1", "MYC"],
 )
 print(result)
 ```
+
+### Download models into a preferred directory
+
+```python
+from deepvregulome import download_models
+
+download_models(
+    models=["CTCFL", "SP1"],
+    model_dir="/path/to/preferred_models",
+)
+```
+
+DeepVRegulome now checks `model_dir` first for local checkpoints and falls back to the Hugging Face cache only when a requested model is not present there.
 
 Output is a pandas DataFrame with columns: `chrom`, `pos`, `ref`, `alt`, `model`, `type`, `prob_ref`, `prob_alt`, `log_odds_change`, `disrupted`.
 
@@ -204,7 +220,7 @@ result = dvr.score_sequence(
 
 | Method | Description |
 |---|---|
-| `DVR(genome=...)` | Initialize with reference genome FASTA path |
+| `DVR(genome=..., model_dir=...)` | Initialize with reference genome FASTA path and an optional preferred model directory |
 | `dvr.score_variant(chrom, pos, ref, alt, models)` | Score a single variant by genomic coordinates |
 | `dvr.score_variants(df, models)` | Batch-score a DataFrame of variants (columns: chrom, pos, ref, alt) |
 | `dvr.score_vcf(vcf_path, models)` | Score all variants in a VCF file |
@@ -300,7 +316,7 @@ All 462 fine-tuned DNABERT models (458 TFs + 4 histone marks) are hosted on Hugg
 
 **[https://huggingface.co/duttaprat/DeepVRegulome](https://huggingface.co/duttaprat/DeepVRegulome)**
 
-Models are automatically downloaded when you use `DVR()`. No manual download is needed.
+Models can still be fetched automatically through the Hugging Face cache, but you can now pre-download them into your own directory with `download_models(..., model_dir=...)` and point `DVR(..., model_dir=...)` or any scoring call at that location.
 
 For direct access without the `deepvregulome` package:
 
