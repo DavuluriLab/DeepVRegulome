@@ -498,7 +498,7 @@ What to do:
 
 ## Relationship to the Wrapper Quickstart
 
-The quickstart in [docs/UsingDeepVRegulomeWrapper.md](/Users/Max_1/Documents/code/test_realms/DeepVRegulome/docs/UsingDeepVRegulomeWrapper.md) is meant for fast setup and immediate use.
+The quickstart in [docs/UsingDeepVRegulomeWrapper.md](UsingDeepVRegulomeWrapper.md) is meant for fast setup and immediate use.
 
 This manual is the long-form companion document. Use it when you need:
 
