@@ -15,6 +15,7 @@ v0.1.5:
 import os
 import math
 import warnings
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 # Suppress tokenizer fork warnings
@@ -43,6 +44,113 @@ except ImportError:
         if desc and total:
             print(f"  {desc} ({total} items)...")
         return iterable
+
+
+HF_SHARED_MODEL_FILES = [
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "vocab.txt",
+]
+
+
+def _normalize_directory(path: Optional[Union[str, os.PathLike]]) -> Optional[Path]:
+    if path is None:
+        return None
+    return Path(path).expanduser().resolve()
+
+
+def _model_root_candidates(model_dir: Optional[Union[str, os.PathLike]], name: str) -> List[Path]:
+    root = _normalize_directory(model_dir)
+    if root is None:
+        return []
+    candidates = [
+        root / "models" / name,
+        root / name,
+    ]
+    if root.name.lower() == name.lower():
+        candidates.append(root)
+    return candidates
+
+
+def _find_local_model_path(name: str, model_dir: Optional[Union[str, os.PathLike]]) -> Optional[Path]:
+    for candidate in _model_root_candidates(model_dir, name):
+        if (candidate / "config.json").exists():
+            return candidate
+    return None
+
+
+def _resolve_model_source(
+    info: ModelInfo,
+    model_dir: Optional[Union[str, os.PathLike]] = None,
+    cache_dir: Optional[Union[str, os.PathLike]] = None,
+) -> dict:
+    local_path = _find_local_model_path(info.name, model_dir)
+    if local_path is not None:
+        return {"pretrained_model_name_or_path": str(local_path), "source": "local"}
+
+    kwargs = {}
+    if cache_dir is not None:
+        kwargs["cache_dir"] = str(_normalize_directory(cache_dir))
+    return {
+        "pretrained_model_name_or_path": info.hf_repo,
+        "subfolder": info.subfolder,
+        "source": "hub",
+        **kwargs,
+    }
+
+
+def download_models(
+    models: Optional[List[str]] = None,
+    model_type: Optional[str] = None,
+    model_dir: Optional[Union[str, os.PathLike]] = None,
+    cache_dir: Optional[Union[str, os.PathLike]] = None,
+    force_download: bool = False,
+) -> Path:
+    """
+    Download model files into a preferred directory.
+
+    The directory is laid out like the Hugging Face repo, so inference can load
+    models directly from `model_dir/models/<MODEL_NAME>`.
+    """
+    if model_dir is None:
+        raise ValueError("'model_dir' is required for download_models()")
+    if models and model_type:
+        raise ValueError("Specify either 'models' or 'model_type', not both")
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise ImportError("huggingface_hub is required to download models") from exc
+
+    registry = ModelRegistry()
+    if models:
+        model_names = [registry.get(name).name for name in models]
+    elif model_type:
+        model_names = [m.name for m in registry.list(model_type=model_type)]
+    else:
+        model_names = registry.names
+
+    destination = _normalize_directory(model_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+
+    allow_patterns = list(HF_SHARED_MODEL_FILES)
+    allow_patterns.extend(f"models/{name}/*" for name in model_names)
+
+    snapshot_kwargs = {
+        "repo_id": "duttaprat/DeepVRegulome",
+        "local_dir": str(destination),
+        "allow_patterns": allow_patterns,
+        "force_download": force_download,
+    }
+    if cache_dir is not None:
+        snapshot_kwargs["cache_dir"] = str(_normalize_directory(cache_dir))
+
+    snapshot_download(**snapshot_kwargs)
+    return destination
+
+
+Download_models = download_models
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +191,7 @@ def _position_attention(attn):
 # ---------------------------------------------------------------------------
 def _gpu_worker(
     gpu_id, model_names, ref_seqs, alt_seqs,
-    batch_size, return_attention, verbose, cache_dir, result_queue,
+    batch_size, return_attention, verbose, model_dir, cache_dir, result_queue,
 ):
     device = f"cuda:{gpu_id}"
     registry = ModelRegistry()
@@ -91,11 +199,13 @@ def _gpu_worker(
 
     for model_idx, name in enumerate(model_names):
         info = registry.get(name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            info.hf_repo, subfolder=info.subfolder, cache_dir=cache_dir)
+        source = _resolve_model_source(info, model_dir=model_dir, cache_dir=cache_dir)
+        load_args = {k: v for k, v in source.items() if k != "source"}
+        tokenizer = AutoTokenizer.from_pretrained(**load_args)
         model = AutoModelForSequenceClassification.from_pretrained(
-            info.hf_repo, subfolder=info.subfolder, cache_dir=cache_dir,
-            output_attentions=return_attention)
+            **load_args,
+            output_attentions=return_attention,
+        )
         model = model.to(device)
         model.eval()
 
@@ -147,9 +257,17 @@ class DVR:
     DeepVRegulome: Score regulatory variant effects using fine-tuned DNABERT models.
     """
 
-    def __init__(self, genome=None, device=None, cache_dir=None, coordinate_system=None):
+    def __init__(
+        self,
+        genome=None,
+        device=None,
+        model_dir=None,
+        cache_dir=None,
+        coordinate_system=None,
+    ):
         self.registry = ModelRegistry()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_dir = model_dir
         self.cache_dir = cache_dir
         self._genome_path = genome
         self._genome = None
@@ -190,11 +308,19 @@ class DVR:
         return pos - self._coord_offset
 
     # --- Model loading and prediction ---
-    def _load_model_to_device(self, name, device):
+    def _load_model_to_device(self, name, device, model_dir=None, cache_dir=None):
         info = self.registry.get(name)
-        tok = AutoTokenizer.from_pretrained(info.hf_repo, subfolder=info.subfolder, cache_dir=self.cache_dir)
+        source = _resolve_model_source(
+            info,
+            model_dir=model_dir if model_dir is not None else self.model_dir,
+            cache_dir=cache_dir if cache_dir is not None else self.cache_dir,
+        )
+        load_args = {k: v for k, v in source.items() if k != "source"}
+        tok = AutoTokenizer.from_pretrained(**load_args)
         mdl = AutoModelForSequenceClassification.from_pretrained(
-            info.hf_repo, subfolder=info.subfolder, cache_dir=self.cache_dir, output_attentions=True)
+            **load_args,
+            output_attentions=True,
+        )
         mdl = mdl.to(device).eval()
         return mdl, tok
 
@@ -225,7 +351,7 @@ class DVR:
     # --- Single-GPU scoring ---
     def _score_sequences_single_gpu(self, ref_seqs, alt_seqs, model_names,
                                      batch_size=1, return_attention=False,
-                                     verbose=False, device=None):
+                                     verbose=False, device=None, model_dir=None, cache_dir=None):
         device = device or self.device
         results = []
 
@@ -233,7 +359,12 @@ class DVR:
         for name in model_pbar:
             model_pbar.set_postfix(current=name)
             info = self.registry.get(name)
-            model, tok = self._load_model_to_device(name, device)
+            model, tok = self._load_model_to_device(
+                name,
+                device,
+                model_dir=model_dir,
+                cache_dir=cache_dir,
+            )
 
             n_batches = math.ceil(len(ref_seqs) / batch_size)
             batch_pbar = tqdm(range(n_batches), desc=f"  {name}", unit="batch", leave=False)
@@ -291,7 +422,8 @@ class DVR:
 
     # --- Multi-GPU scoring ---
     def _score_sequences_multi_gpu(self, ref_seqs, alt_seqs, model_names,
-                                    gpus, batch_size=32, return_attention=False, verbose=False):
+                                    gpus, batch_size=32, return_attention=False, verbose=False,
+                                    model_dir=None, cache_dir=None):
         import torch.multiprocessing as mp
         n = len(gpus)
         splits = [model_names[i*len(model_names)//n:(i+1)*len(model_names)//n] for i in range(n)]
@@ -304,7 +436,7 @@ class DVR:
             if not splits[i]: continue
             p = mp.Process(target=_gpu_worker, args=(
                 gid, splits[i], ref_seqs, alt_seqs, batch_size,
-                return_attention, verbose, self.cache_dir, q))
+                return_attention, verbose, model_dir, cache_dir, q))
             p.start()
             procs.append(p)
 
@@ -319,7 +451,8 @@ class DVR:
     # PUBLIC API
     # ==================================================================
     def score_sequence(self, ref_seq, alt_seq, models=None, model_type=None,
-                       batch_size=1, gpus=None, return_attention=False, verbose=False):
+                       batch_size=1, gpus=None, return_attention=False, verbose=False,
+                       model_dir=None, cache_dir=None):
         if isinstance(ref_seq, str):
             ref_seqs, alt_seqs = [ref_seq], [alt_seq]
         else:
@@ -332,12 +465,14 @@ class DVR:
         if gpus and len(gpus) > 1:
             raw = self._score_sequences_multi_gpu(ref_seqs, alt_seqs, model_names,
                                                    gpus=gpus, batch_size=batch_size,
-                                                   return_attention=return_attention, verbose=verbose)
+                                                   return_attention=return_attention, verbose=verbose,
+                                                   model_dir=model_dir, cache_dir=cache_dir)
         else:
             device = f"cuda:{gpus[0]}" if gpus else self.device
             raw = self._score_sequences_single_gpu(ref_seqs, alt_seqs, model_names,
                                                     batch_size=batch_size, return_attention=return_attention,
-                                                    verbose=verbose, device=device)
+                                                    verbose=verbose, device=device,
+                                                    model_dir=model_dir, cache_dir=cache_dir)
 
         df = pd.DataFrame(raw)
         if "_var_idx" in df.columns:
@@ -347,14 +482,16 @@ class DVR:
         return df.reset_index(drop=True)
 
     def score_variant(self, chrom, pos, ref, alt, models=None, model_type=None,
-                      flank=150, batch_size=1, gpus=None, return_attention=False, verbose=False):
+                      flank=150, batch_size=1, gpus=None, return_attention=False, verbose=False,
+                      model_dir=None, cache_dir=None):
         self._run_sanity_check([{"chrom": chrom, "pos": pos, "ref": ref, "alt": alt}])
         pos_0 = self._adjust_pos(pos)
         ref_seq, alt_seq = extract_variant_sequences(self.genome, chrom, pos_0, ref, alt, flank=flank)
 
         df = self.score_sequence(ref_seq, alt_seq, models=models, model_type=model_type,
                                   batch_size=batch_size, gpus=gpus,
-                                  return_attention=return_attention, verbose=verbose)
+                                  return_attention=return_attention, verbose=verbose,
+                                  model_dir=model_dir, cache_dir=cache_dir)
         df.insert(0, "chrom", chrom)
         df.insert(1, "pos", pos)
         df.insert(2, "ref", ref)
@@ -370,7 +507,8 @@ class DVR:
         return df
 
     def score_variants(self, variants, models=None, model_type=None, flank=150,
-                       batch_size=32, gpus=None, return_attention=False, verbose=False):
+                       batch_size=32, gpus=None, return_attention=False, verbose=False,
+                       model_dir=None, cache_dir=None):
         # Auto-detect column names
         col_map = {}
         for col in variants.columns:
@@ -417,12 +555,14 @@ class DVR:
         if gpus and len(gpus) > 1:
             raw = self._score_sequences_multi_gpu(ref_seqs, alt_seqs, model_names,
                                                    gpus=gpus, batch_size=batch_size,
-                                                   return_attention=return_attention, verbose=verbose)
+                                                   return_attention=return_attention, verbose=verbose,
+                                                   model_dir=model_dir, cache_dir=cache_dir)
         else:
             device = f"cuda:{gpus[0]}" if gpus else self.device
             raw = self._score_sequences_single_gpu(ref_seqs, alt_seqs, model_names,
                                                     batch_size=batch_size, return_attention=return_attention,
-                                                    verbose=verbose, device=device)
+                                                    verbose=verbose, device=device,
+                                                    model_dir=model_dir, cache_dir=cache_dir)
 
         df = pd.DataFrame(raw)
         if len(df) > 0 and "_var_idx" in df.columns:
@@ -437,7 +577,8 @@ class DVR:
         return df.reset_index(drop=True)
 
     def score_vcf(self, vcf_path, models=None, model_type=None, flank=150,
-                  batch_size=32, gpus=None, return_attention=False, verbose=False, max_variants=None):
+                  batch_size=32, gpus=None, return_attention=False, verbose=False, max_variants=None,
+                  model_dir=None, cache_dir=None):
         print(f"Parsing VCF: {vcf_path}")
         vlist = parse_vcf(vcf_path, max_variants=max_variants)
         print(f"  Found {len(vlist)} variants")
@@ -445,7 +586,19 @@ class DVR:
             return pd.DataFrame()
         return self.score_variants(pd.DataFrame(vlist), models=models, model_type=model_type,
                                     flank=flank, batch_size=batch_size, gpus=gpus,
-                                    return_attention=return_attention, verbose=verbose)
+                                    return_attention=return_attention, verbose=verbose,
+                                    model_dir=model_dir, cache_dir=cache_dir)
+
+    def download_models(self, models=None, model_type=None, model_dir=None, cache_dir=None, force_download=False):
+        target_model_dir = model_dir if model_dir is not None else self.model_dir
+        target_cache_dir = cache_dir if cache_dir is not None else self.cache_dir
+        return download_models(
+            models=models,
+            model_type=model_type,
+            model_dir=target_model_dir,
+            cache_dir=target_cache_dir,
+            force_download=force_download,
+        )
 
     # ==================================================================
     # ATTENTION ACCESS AND VISUALIZATION
@@ -662,7 +815,8 @@ class DVR:
 
     def __repr__(self):
         g = f", genome='{self._genome_path}'" if self._genome_path else ""
-        return f"DVR(device='{self.device}'{g}, {self.registry})"
+        m = f", model_dir='{self.model_dir}'" if self.model_dir else ""
+        return f"DVR(device='{self.device}'{g}{m}, {self.registry})"
 
     def __del__(self):
         if self._genome is not None:

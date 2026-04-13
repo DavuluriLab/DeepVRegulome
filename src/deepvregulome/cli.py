@@ -25,7 +25,7 @@ import sys
 def cmd_score(args):
     from deepvregulome import DVR
 
-    dvr = DVR(genome=args.genome, device=args.device)
+    dvr = DVR(genome=args.genome, device=args.device, model_dir=args.model_dir, cache_dir=args.cache_dir)
     result = dvr.score_variant(
         chrom=args.chrom,
         pos=args.pos,
@@ -34,6 +34,8 @@ def cmd_score(args):
         models=args.models,
         model_type=args.type,
         return_attention=args.attention,
+        model_dir=args.model_dir,
+        cache_dir=args.cache_dir,
     )
 
     if args.output:
@@ -46,13 +48,15 @@ def cmd_score(args):
 def cmd_score_seq(args):
     from deepvregulome import DVR
 
-    dvr = DVR(device=args.device)
+    dvr = DVR(device=args.device, model_dir=args.model_dir, cache_dir=args.cache_dir)
     result = dvr.score_sequence(
         ref_seq=args.ref,
         alt_seq=args.alt,
         models=args.models,
         model_type=args.type,
         return_attention=args.attention,
+        model_dir=args.model_dir,
+        cache_dir=args.cache_dir,
     )
 
     if args.output:
@@ -64,13 +68,15 @@ def cmd_score_seq(args):
 def cmd_score_vcf(args):
     from deepvregulome import DVR
 
-    dvr = DVR(genome=args.genome, device=args.device)
+    dvr = DVR(genome=args.genome, device=args.device, model_dir=args.model_dir, cache_dir=args.cache_dir)
     result = dvr.score_vcf(
         vcf_path=args.vcf,
         models=args.models,
         model_type=args.type,
         return_attention=args.attention,
         max_variants=args.max_variants,
+        model_dir=args.model_dir,
+        cache_dir=args.cache_dir,
     )
 
     output = args.output or args.vcf.replace(".vcf", "_dvr_scores.tsv")
@@ -103,6 +109,19 @@ def cmd_search(args):
         print(f"No models found matching '{args.query}'")
 
 
+def cmd_download_models(args):
+    from deepvregulome import download_models
+
+    downloaded_to = download_models(
+        models=args.models,
+        model_type=args.type,
+        model_dir=args.model_dir,
+        cache_dir=args.cache_dir,
+        force_download=args.force_download,
+    )
+    print(f"Models downloaded to {downloaded_to}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="deepvregulome",
@@ -121,6 +140,8 @@ def main():
     p_score.add_argument("--genome", required=True, help="Reference genome FASTA")
     p_score.add_argument("--attention", action="store_true", help="Include attention scores")
     p_score.add_argument("--device", default=None, help="cuda or cpu")
+    p_score.add_argument("--model-dir", default=None, help="Preferred local model directory")
+    p_score.add_argument("--cache-dir", default=None, help="Fallback Hugging Face cache directory")
     p_score.add_argument("-o", "--output", help="Output TSV file")
     p_score.set_defaults(func=cmd_score)
 
@@ -132,6 +153,8 @@ def main():
     p_seq.add_argument("--type", choices=["TF", "HISTONE"], help="Score all of type")
     p_seq.add_argument("--attention", action="store_true")
     p_seq.add_argument("--device", default=None)
+    p_seq.add_argument("--model-dir", default=None, help="Preferred local model directory")
+    p_seq.add_argument("--cache-dir", default=None, help="Fallback Hugging Face cache directory")
     p_seq.add_argument("-o", "--output", help="Output TSV file")
     p_seq.set_defaults(func=cmd_score_seq)
 
@@ -144,6 +167,8 @@ def main():
     p_vcf.add_argument("--attention", action="store_true")
     p_vcf.add_argument("--max-variants", type=int, help="Max variants to score")
     p_vcf.add_argument("--device", default=None)
+    p_vcf.add_argument("--model-dir", default=None, help="Preferred local model directory")
+    p_vcf.add_argument("--cache-dir", default=None, help="Fallback Hugging Face cache directory")
     p_vcf.add_argument("-o", "--output", help="Output TSV file")
     p_vcf.set_defaults(func=cmd_score_vcf)
 
@@ -156,6 +181,15 @@ def main():
     p_search = sub.add_parser("search", help="Search model names")
     p_search.add_argument("query", help="Search string (e.g., ZNF, GATA)")
     p_search.set_defaults(func=cmd_search)
+
+    # --- download-models ---
+    p_download = sub.add_parser("download-models", help="Download models into a preferred directory")
+    p_download.add_argument("--models", nargs="+", help="Model names to download")
+    p_download.add_argument("--type", choices=["TF", "HISTONE"], help="Download all models of this type")
+    p_download.add_argument("--model-dir", required=True, help="Target local model directory")
+    p_download.add_argument("--cache-dir", default=None, help="Optional Hugging Face cache directory")
+    p_download.add_argument("--force-download", action="store_true", help="Re-download even if files exist")
+    p_download.set_defaults(func=cmd_download_models)
 
     args = parser.parse_args()
     if not args.command:
