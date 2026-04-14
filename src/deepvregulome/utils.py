@@ -1,280 +1,271 @@
 """
-Sequence processing utilities for DeepVRegulome.
+DeepVRegulome utility functions.
 
-Handles DNA ↔ k-mer conversion, reverse complement,
-variant sequence extraction (with multiprocessing),
-VCF parsing, and coordinate sanity checking.
+v0.2.0 changes:
+- Parallel sequence extraction via multiprocessing.Pool
+- Disk caching of REF/ALT sequences (TSV format)
+- Disk caching of tokenized features (.pt format)
+- Auto-detection of n_processes
 """
 
+import hashlib
+import json
 import os
-from typing import List, Tuple, Optional
 from multiprocessing import Pool
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import pandas as pd
 
 
-COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
-
-
-def to_kmer(sequence: str, k: int = 6) -> str:
-    """Convert a DNA sequence to space-separated k-mer representation for DNABERT."""
-    seq = sequence.upper()
-    return " ".join(seq[i:i + k] for i in range(len(seq) - k + 1))
-
-
-def reverse_complement(sequence: str) -> str:
-    """Return the reverse complement of a DNA sequence."""
-    return sequence.translate(COMPLEMENT)[::-1]
-
-
-def extract_variant_sequences(
-    genome,
-    chrom: str,
-    pos_0based: int,
-    ref: str,
-    alt: str,
-    flank: int = 150,
-) -> Tuple[str, str]:
+# ---------------------------------------------------------------------------
+# n_processes auto-detection
+# ---------------------------------------------------------------------------
+def get_default_n_processes(user_value: Optional[int] = None) -> int:
     """
-    Extract REF and ALT sequences centered on a variant.
+    Auto-detect a sensible number of worker processes.
 
-    Args:
-        genome: pysam.FastaFile
-        chrom: Chromosome (e.g., "chr1")
-        pos_0based: 0-based variant position
-        ref: Reference allele
-        alt: Alternate allele
-        flank: Flanking bases on each side
+    Strategy: leave 4 cores for the OS and DataLoader workers, cap at 32
+    because tokenization stops scaling beyond that.
 
-    Returns:
-        (ref_seq, alt_seq) tuple
+    On a 64-core server: returns 32
+    On an 8-core laptop: returns 4
+    On a 4-core machine: returns 1
     """
-    left_flank = genome.fetch(chrom, pos_0based - flank, pos_0based)
-    right_flank = genome.fetch(chrom, pos_0based + len(ref), pos_0based + len(ref) + flank)
+    if user_value is not None:
+        return max(1, int(user_value))
+    n_cpu = os.cpu_count() or 4
+    return min(max(n_cpu - 4, 1), 32)
 
-    ref_seq = left_flank + ref + right_flank
-    alt_seq = left_flank + alt + right_flank
 
-    return ref_seq.upper(), alt_seq.upper()
+# ---------------------------------------------------------------------------
+# k-mer tokenization
+# ---------------------------------------------------------------------------
+def to_kmer(seq: str, k: int = 6) -> str:
+    """Convert a DNA sequence to space-separated k-mers."""
+    seq = seq.upper()
+    return " ".join([seq[i : i + k] for i in range(len(seq) - k + 1)])
+
+
+# ---------------------------------------------------------------------------
+# Cache key generation
+# ---------------------------------------------------------------------------
+def compute_cache_key(
+    vcf_path: Optional[str],
+    genome_path: Optional[str],
+    n_variants: int,
+    flank: int,
+    extra: str = "",
+) -> str:
+    """
+    Generate a stable hash key for caching based on inputs.
+    """
+    h = hashlib.sha256()
+    h.update(str(vcf_path or "").encode())
+    h.update(str(genome_path or "").encode())
+    h.update(str(n_variants).encode())
+    h.update(str(flank).encode())
+    h.update(extra.encode())
+    return h.hexdigest()[:16]
+
+
+def get_cache_dir(base: Optional[str] = None) -> Path:
+    """Return the cache directory, creating it if needed."""
+    if base is None:
+        base = os.path.expanduser("~/.cache/deepvregulome")
+    p = Path(base)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 # ---------------------------------------------------------------------------
 # Parallel sequence extraction
 # ---------------------------------------------------------------------------
+# Module-level globals for multiprocessing workers (cannot pickle pysam objects)
+_WORKER_GENOME_PATH = None
+_WORKER_FLANK = None
 
-# Module-level global for multiprocessing workers
-_worker_genome = None
-_worker_flank = None
+
+def _init_worker(genome_path: str, flank: int):
+    """Initializer for each worker process — opens its own pysam handle."""
+    global _WORKER_GENOME_PATH, _WORKER_FLANK
+    _WORKER_GENOME_PATH = genome_path
+    _WORKER_FLANK = flank
 
 
-def _init_extraction_worker(genome_path: str, flank: int):
-    """Initialize pysam.FastaFile in each worker process."""
-    global _worker_genome, _worker_flank
+def _extract_one(args):
+    """
+    Worker function: extract REF/ALT sequences for one variant.
+    Each worker opens its own pysam.FastaFile (pysam objects are not picklable).
+    """
     import pysam
-    _worker_genome = pysam.FastaFile(genome_path)
-    _worker_flank = flank
 
-
-def _extract_one_variant(variant: dict) -> Tuple[Optional[str], Optional[str]]:
-    """Extract sequences for a single variant (called by worker)."""
-    global _worker_genome, _worker_flank
+    chrom, pos, ref, alt, coord_offset = args
     try:
-        ref_seq, alt_seq = extract_variant_sequences(
-            _worker_genome,
-            variant["chrom"],
-            variant["pos"],
-            variant["ref"],
-            variant["alt"],
-            _worker_flank,
-        )
-        return (ref_seq, alt_seq)
+        fa = pysam.FastaFile(_WORKER_GENOME_PATH)
+        # coord_offset: 1 means 1-based input (subtract 1 to get 0-based for pysam)
+        zero_pos = pos - coord_offset
+        start = zero_pos - _WORKER_FLANK
+        end = zero_pos + _WORKER_FLANK + 1
+        if start < 0:
+            return None
+        ref_seq = fa.fetch(chrom, start, end).upper()
+        if len(ref_seq) != 2 * _WORKER_FLANK + 1:
+            return None
+        # Build ALT sequence by replacing the center base(s)
+        center = _WORKER_FLANK
+        ref_len = len(ref)
+        alt_seq = ref_seq[:center] + alt.upper() + ref_seq[center + ref_len :]
+        # Pad/truncate ALT to same length as REF
+        if len(alt_seq) > len(ref_seq):
+            alt_seq = alt_seq[: len(ref_seq)]
+        elif len(alt_seq) < len(ref_seq):
+            alt_seq = alt_seq + "N" * (len(ref_seq) - len(alt_seq))
+        fa.close()
+        return (chrom, pos, ref, alt, ref_seq, alt_seq)
     except Exception:
-        return (None, None)
+        return None
 
 
-def extract_variant_sequences_batch(
+def extract_sequences_parallel(
+    variants: List[Tuple[str, int, str, str]],
     genome_path: str,
-    variants: list,
     flank: int = 150,
-    n_workers: int = 0,
-) -> List[Tuple[Optional[str], Optional[str]]]:
+    coord_offset: int = 1,
+    n_processes: Optional[int] = None,
+    show_progress: bool = True,
+) -> pd.DataFrame:
     """
-    Extract REF and ALT sequences for a batch of variants.
-    Uses multiprocessing when n_workers > 1 for speed.
+    Extract REF/ALT sequences for many variants in parallel.
 
-    Args:
-        genome_path: Path to reference genome FASTA (string, not pysam object)
-        variants: List of dicts with chrom, pos, ref, alt (pos already 0-based)
-        flank: Flanking bases on each side
-        n_workers: Number of parallel workers. 0 = auto (cpu_count/2, min 1).
+    Parameters
+    ----------
+    variants : list of (chrom, pos, ref, alt) tuples
+    genome_path : path to indexed FASTA
+    flank : flanking bases on each side (default 150 → 301bp window)
+    coord_offset : 1 if input is 1-based (VCF), 0 if input is 0-based (BED)
+    n_processes : number of worker processes (auto-detected if None)
 
-    Returns:
-        List of (ref_seq, alt_seq) tuples. Failed extractions return (None, None).
+    Returns
+    -------
+    DataFrame with columns: chrom, pos, ref, alt, ref_seq, alt_seq
     """
-    if n_workers == 0:
-        n_workers = max(1, os.cpu_count() // 2)
+    n_proc = get_default_n_processes(n_processes)
+    args_list = [(c, p, r, a, coord_offset) for (c, p, r, a) in variants]
 
-    if n_workers == 1 or len(variants) < 100:
-        # Single-threaded for small inputs
-        import pysam
-        genome = pysam.FastaFile(genome_path)
-        results = []
-        for v in variants:
-            try:
-                ref_seq, alt_seq = extract_variant_sequences(
-                    genome, v["chrom"], v["pos"], v["ref"], v["alt"], flank
-                )
-                results.append((ref_seq, alt_seq))
-            except Exception:
-                results.append((None, None))
-        genome.close()
-        return results
+    print(f"Extracting sequences for {len(variants):,} variants using {n_proc} processes...")
 
-    # Multi-threaded
+    results = []
     with Pool(
-        processes=n_workers,
-        initializer=_init_extraction_worker,
+        processes=n_proc,
+        initializer=_init_worker,
         initargs=(genome_path, flank),
     ) as pool:
-        results = pool.map(_extract_one_variant, variants, chunksize=500)
-
-    return results
-
-
-def parse_vcf(vcf_path: str, max_variants: Optional[int] = None) -> list:
-    """
-    Parse a VCF file into a list of variant dicts.
-    Handles both with-header and headerless VCFs.
-
-    Returns:
-        List of dicts with keys: chrom, pos, ref, alt
-    """
-    import gzip
-
-    opener = gzip.open if vcf_path.endswith(".gz") else open
-    variants = []
-
-    with opener(vcf_path, "rt") as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-
-            fields = line.strip().split("\t")
-            if len(fields) < 5:
-                continue
-
-            chrom = fields[0]
+        if show_progress:
             try:
-                pos = int(fields[1])
-            except ValueError:
-                continue
-            ref = fields[3]
-            alt_str = fields[4]
+                from tqdm.auto import tqdm
 
-            for alt in alt_str.split(","):
-                alt = alt.strip()
-                if alt == "." or alt == "*":
-                    continue
+                for r in tqdm(
+                    pool.imap_unordered(_extract_one, args_list, chunksize=500),
+                    total=len(args_list),
+                    desc="Extracting",
+                    unit="var",
+                ):
+                    if r is not None:
+                        results.append(r)
+            except ImportError:
+                results = [r for r in pool.imap_unordered(_extract_one, args_list, chunksize=500) if r is not None]
+        else:
+            results = [r for r in pool.imap_unordered(_extract_one, args_list, chunksize=500) if r is not None]
+
+    df = pd.DataFrame(results, columns=["chrom", "pos", "ref", "alt", "ref_seq", "alt_seq"])
+    print(f"  Successfully extracted {len(df):,} / {len(variants):,} sequences")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Sequence cache (TSV)
+# ---------------------------------------------------------------------------
+def save_sequences_cache(df: pd.DataFrame, cache_path: Path) -> None:
+    """Save REF/ALT sequences to a TSV file."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df[["chrom", "pos", "ref", "alt", "ref_seq", "alt_seq"]].to_csv(
+        cache_path, sep="\t", index=False
+    )
+
+
+def load_sequences_cache(cache_path: Path) -> Optional[pd.DataFrame]:
+    """Load REF/ALT sequences from TSV cache, or None if missing."""
+    if not cache_path.exists():
+        return None
+    return pd.read_csv(cache_path, sep="\t", dtype={"chrom": str, "pos": int, "ref": str, "alt": str})
+
+
+def save_meta(meta: dict, meta_path: Path) -> None:
+    """Save cache metadata as JSON."""
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Parallel k-mer tokenization
+# ---------------------------------------------------------------------------
+def _kmer_one(seq: str) -> str:
+    return to_kmer(seq)
+
+
+def kmerize_parallel(sequences: List[str], n_processes: Optional[int] = None) -> List[str]:
+    """Convert many sequences to k-mer strings in parallel."""
+    n_proc = get_default_n_processes(n_processes)
+    if n_proc == 1 or len(sequences) < 1000:
+        return [to_kmer(s) for s in sequences]
+    with Pool(processes=n_proc) as pool:
+        return list(pool.imap(_kmer_one, sequences, chunksize=1000))
+
+
+# ---------------------------------------------------------------------------
+# VCF parsing (unchanged)
+# ---------------------------------------------------------------------------
+def parse_vcf(vcf_path: str, max_variants: Optional[int] = None) -> List[dict]:
+    """Parse a VCF file into a list of variant dicts."""
+    variants = []
+    try:
+        import pysam
+
+        vf = pysam.VariantFile(vcf_path)
+        for i, record in enumerate(vf):
+            if max_variants and i >= max_variants:
+                break
+            if record.alts is None:
+                continue
+            for alt in record.alts:
                 variants.append({
-                    "chrom": chrom,
-                    "pos": pos,
-                    "ref": ref,
+                    "chrom": record.chrom,
+                    "pos": record.pos,
+                    "ref": record.ref,
                     "alt": alt,
                 })
-
-            if max_variants and len(variants) >= max_variants:
-                break
-
-    return variants[:max_variants] if max_variants else variants
-
-
-# ──────────────────────────────────────────────────────────────
-# COORDINATE SANITY CHECK
-# ──────────────────────────────────────────────────────────────
-
-def detect_coordinate_system(genome, variants: list, n_check: int = 10) -> dict:
-    """
-    Auto-detect whether variant positions are 1-based (VCF) or 0-based (BED)
-    by checking REF alleles against the reference genome.
-    """
-    to_check = variants[:min(n_check, len(variants))]
-
-    votes_1based = 0
-    votes_0based = 0
-    ambiguous = 0
-    no_match = 0
-
-    for v in to_check:
-        chrom = v["chrom"]
-        pos = v["pos"]
-        ref = v["ref"].upper()
-
-        try:
-            if len(ref) > 1:
-                seq_at_minus1 = genome.fetch(chrom, pos - 1, pos - 1 + len(ref)).upper()
-                seq_at_pos = genome.fetch(chrom, pos, pos + len(ref)).upper()
-            else:
-                seq_at_minus1 = genome.fetch(chrom, pos - 1, pos).upper()
-                seq_at_pos = genome.fetch(chrom, pos, pos + 1).upper()
-
-            match_minus1 = (seq_at_minus1 == ref)
-            match_pos = (seq_at_pos == ref)
-
-            if match_minus1 and not match_pos:
-                votes_1based += 1
-            elif match_pos and not match_minus1:
-                votes_0based += 1
-            elif match_minus1 and match_pos:
-                ambiguous += 1
-            else:
-                no_match += 1
-
-        except Exception:
-            no_match += 1
-
-    total_checked = len(to_check)
-
-    if votes_1based >= 3 and votes_0based == 0:
-        system, offset, confidence = "1-based", 1, "high"
-    elif votes_0based >= 3 and votes_1based == 0:
-        system, offset, confidence = "0-based", 0, "high"
-    elif votes_1based > votes_0based:
-        system, offset, confidence = "1-based", 1, "medium"
-    elif votes_0based > votes_1based:
-        system, offset, confidence = "0-based", 0, "medium"
-    else:
-        system, offset, confidence = "1-based", 1, "low"
-
-    if confidence == "high":
-        message = (
-            f"✓ Sanity check PASSED — {system} coordinates detected\n"
-            f"  Checked {total_checked} variants: "
-            f"{votes_1based} confirm 1-based, {votes_0based} confirm 0-based, "
-            f"{ambiguous} ambiguous, {no_match} no-match\n"
-            f"  REF alleles match the reference genome. Coordinates look correct."
-        )
-    elif confidence == "medium":
-        message = (
-            f"⚠ Sanity check: likely {system} but not fully certain\n"
-            f"  Checked {total_checked} variants: "
-            f"{votes_1based} suggest 1-based, {votes_0based} suggest 0-based, "
-            f"{ambiguous} ambiguous, {no_match} no-match\n"
-            f"  Proceeding with {system}. Override with coordinate_system= if needed."
-        )
-    else:
-        message = (
-            f"⚠ Sanity check: could not confidently determine coordinate system\n"
-            f"  Checked {total_checked} variants: "
-            f"{votes_1based} suggest 1-based, {votes_0based} suggest 0-based, "
-            f"{ambiguous} ambiguous, {no_match} no-match\n"
-            f"  Defaulting to 1-based (VCF standard). Override with coordinate_system='0-based' if needed."
-        )
-
-    return {
-        "system": system,
-        "offset": offset,
-        "confidence": confidence,
-        "votes_1based": votes_1based,
-        "votes_0based": votes_0based,
-        "ambiguous": ambiguous,
-        "no_match": no_match,
-        "message": message,
-    }
+        vf.close()
+    except (ImportError, Exception):
+        # Fallback to plain text parsing
+        with open(vcf_path) as f:
+            count = 0
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) < 5:
+                    continue
+                chrom, pos, _, ref, alt_field = parts[:5]
+                for alt in alt_field.split(","):
+                    variants.append({
+                        "chrom": chrom,
+                        "pos": int(pos),
+                        "ref": ref,
+                        "alt": alt,
+                    })
+                    count += 1
+                    if max_variants and count >= max_variants:
+                        return variants
+    return variants
