@@ -365,6 +365,7 @@ jupyter lab notebooks/
 An interactive dashboard for exploring variant predictions and clinical stratification is available:
 
 - **Live demo:** [https://deepvregulome.streamlit.app](https://deepvregulome.streamlit.app)
+- **HuggingFace Space (try predictions live):** [https://huggingface.co/spaces/duttaprat/DeepVRegulome](https://huggingface.co/spaces/duttaprat/DeepVRegulome)
 
 
 ---
