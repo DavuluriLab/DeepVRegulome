@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://pypi.org/project/deepvregulome/"><img src="https://img.shields.io/pypi/v/deepvregulome?color=blue" alt="PyPI"></a>
   <a href="https://huggingface.co/duttaprat/DeepVRegulome"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Models-yellow" alt="HuggingFace"></a>
+  <a href="https://huggingface.co/spaces/duttaprat/DeepVRegulome"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Live%20Demo-blue" alt="HuggingFace Space"></a>
   <a href="https://arxiv.org/abs/2511.09026"><img src="https://img.shields.io/badge/arXiv-2511.09026-b31b1b" alt="arXiv"></a>
   <a href="https://deepvregulome.streamlit.app"><img src="https://img.shields.io/badge/demo-Streamlit-ff4b4b" alt="Streamlit"></a>
   <a href="https://creativecommons.org/licenses/by-nc/4.0/"><img src="https://img.shields.io/badge/license-CC--BY--NC--4.0-green" alt="License"></a>
