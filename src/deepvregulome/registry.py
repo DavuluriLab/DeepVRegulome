@@ -1,5 +1,5 @@
 """
-Model registry — catalog of all 462 DeepVRegulome fine-tuned DNABERT models.
+Model registry — catalog of all 464 DeepVRegulome fine-tuned DNABERT models.
 
 All models live in a single HuggingFace repo (duttaprat/DeepVRegulome)
 under models/<NAME>/ subfolders.
@@ -33,7 +33,7 @@ class ModelInfo:
 
     @property
     def input_length(self) -> int:
-        return 301  # all DVR models use 301bp
+        return 90 if self.model_type == "SPLICE" else 301
 
 
 class ModelRegistry:
@@ -74,7 +74,7 @@ class ModelRegistry:
         return self._models[name]
 
     def list(self, model_type: Optional[str] = None) -> List[ModelInfo]:
-        """List all models, optionally filtered by type ('TF' or 'HISTONE')."""
+        """List all models, optionally filtered by type ('TF', 'HISTONE', or 'SPLICE')."""
         models = list(self._models.values())
         if model_type:
             mt = model_type.upper()
@@ -99,7 +99,8 @@ class ModelRegistry:
     def __repr__(self) -> str:
         tf = sum(1 for m in self._models.values() if m.model_type == "TF")
         hist = sum(1 for m in self._models.values() if m.model_type == "HISTONE")
-        return f"ModelRegistry({tf} TF + {hist} histone = {len(self)} models)"
+        splice = sum(1 for m in self._models.values() if m.model_type == "SPLICE")
+        return f"ModelRegistry({tf} TF + {hist} histone + {splice} splice = {len(self)} models)"
 
 
 # ============================================================
@@ -569,4 +570,7 @@ _MODEL_DATA = [
     ("ZNF19", "TF", 85.06, 84.17, 91.34, 93.34, 1998),
     ("SMAD5", "TF", 85.03, 79.12, 92.23, 90.37, 22402),
     ("SNRNP70", "TF", 85.02, 82.87, 89.28, 89.69, 871),
+    # --- Splice-site models (GENCODE v41 exon-intron junctions, 90bp) ---
+    ("splice_acceptor", "SPLICE", 93.16, 93.26, 00.00, 00.00, 0),
+    ("splice_donor", "SPLICE", 94.71, 94.66, 00.00, 00.00, 0),
 ]
