@@ -12,7 +12,7 @@
   <a href="https://creativecommons.org/licenses/by-nc/4.0/"><img src="https://img.shields.io/badge/license-CC--BY--NC--4.0-green" alt="License"></a>
 </p>
 
-**DeepVRegulome** is a DNABERT-based deep-learning framework for predicting the functional impact of short genomic variants on the human regulome. It provides **462 fine-tuned models** (458 transcription factors + 4 histone modifications) trained on ENCODE ChIP-seq data, covering splice-site and transcription-factor-binding-site disruption analysis.
+**DeepVRegulome** is a DNABERT-based deep-learning framework for predicting the functional impact of short genomic variants on the human regulome. It provides **464 fine-tuned models** ((458 transcription factors + 4 histone modifications + 2 splice sites) trained on ENCODE ChIP-seq data, covering splice-site and transcription-factor-binding-site disruption analysis.
 
 ---
 
