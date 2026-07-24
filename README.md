@@ -12,7 +12,7 @@
   <a href="https://creativecommons.org/licenses/by-nc/4.0/"><img src="https://img.shields.io/badge/license-CC--BY--NC--4.0-green" alt="License"></a>
 </p>
 
-**DeepVRegulome** is a DNABERT-based deep-learning framework for predicting the functional impact of short genomic variants on the human regulome. It provides **464 fine-tuned models** (458 transcription factors + 4 histone modifications + 2 splice sites) trained on ENCODE ChIP-seq data, covering splice-site and transcription factor binding site disruption analysis.
+**DeepVRegulome** is a DNABERT-based deep-learning framework for predicting the functional impact of short genomic variants on the human regulome. It provides **464 fine-tuned models** (458 transcription factors + 4 histone modifications + 2 splice sites) trained on ENCODE ChIP-seq and GENCODE data, covering splice-site and transcription factor binding site disruption analysis.
 
 ---
 
@@ -20,6 +20,7 @@
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Splice-Site Scoring](#splice-site-scoring)
 - [Python API Reference](#python-api-reference)
 - [External Data Requirements](#external-data-requirements)
 - [Repository Structure](#repository-structure)
@@ -205,12 +206,69 @@ results = dvr.score_variants(
 ### Score pre-extracted sequences
 
 ```python
+# TF/histone models use 301bp sequences
 result = dvr.score_sequence(
     ref_seq="ATCGATCG...",   # 301bp reference sequence
     alt_seq="ATCGTTCG...",   # 301bp alternate sequence
     models=["CTCFL"]
 )
 ```
+
+---
+
+## Splice-Site Scoring
+
+DeepVRegulome includes two splice-site models fine-tuned on GENCODE v41 exon-intron junctions using 90bp input sequences:
+
+| Model | Description |
+|---|---|
+| `splice_acceptor` | Predicts acceptor (3') splice site recognition |
+| `splice_donor` | Predicts donor (5') splice site recognition |
+
+### List splice models
+
+```python
+from deepvregulome import DVR
+
+dvr = DVR()
+
+# List only splice-site models
+splice_models = dvr.list_models(model_type="SPLICE")
+for m in splice_models:
+    print(f"{m.name}  (input: {m.input_length}bp)")
+# splice_acceptor  (input: 90bp)
+# splice_donor     (input: 90bp)
+```
+
+### Score a splice-site variant
+
+```python
+# Splice-site models use 90bp sequences centered on the exon-intron boundary
+result = dvr.score_sequence(
+    ref_seq="ATCG...90bp...GATC",   # 90bp reference sequence
+    alt_seq="ATCG...90bp...GTTC",   # 90bp with variant
+    models=["splice_acceptor", "splice_donor"],
+)
+print(result)
+```
+
+### Use without the DVR wrapper
+
+```python
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+# Load splice acceptor model directly from HuggingFace
+tokenizer = AutoTokenizer.from_pretrained(
+    "duttaprat/DeepVRegulome", subfolder="models/splice_acceptor"
+)
+model = AutoModelForSequenceClassification.from_pretrained(
+    "duttaprat/DeepVRegulome", subfolder="models/splice_acceptor"
+)
+```
+
+> **Note:** Splice-site models use **90bp** input sequences, not 301bp like TF/histone models.
+> When using `score_variant()` or `score_vcf()`, ensure the variant falls within a
+> known exon-intron junction region for meaningful predictions.
 
 ---
 
@@ -224,9 +282,9 @@ result = dvr.score_sequence(
 | `dvr.score_variant(chrom, pos, ref, alt, models)` | Score a single variant by genomic coordinates |
 | `dvr.score_variants(df, models)` | Batch-score a DataFrame of variants (columns: chrom, pos, ref, alt) |
 | `dvr.score_vcf(vcf_path, models)` | Score all variants in a VCF file |
-| `dvr.score_sequence(ref_seq, alt_seq, models)` | Score pre-extracted 301bp REF/ALT sequences |
-| `dvr.list_models(model_type=None)` | List available models; filter by `"TF"` or `"HISTONE"` |
-| `dvr.search_models(query)` | Search models by name (e.g., `"ZNF"`, `"GATA"`) |
+| `dvr.score_sequence(ref_seq, alt_seq, models)` | Score pre-extracted REF/ALT sequences (301bp for TF/histone, 90bp for splice) |
+| `dvr.list_models(model_type=None)` | List available models; filter by `"TF"`, `"HISTONE"`, or `"SPLICE"` |
+| `dvr.search_models(query)` | Search models by name (e.g., `"ZNF"`, `"GATA"`, `"splice"`) |
 
 ### Scoring parameters
 
@@ -234,8 +292,8 @@ All scoring methods accept these optional arguments:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `models` | required | List of model names (e.g., `["CTCFL", "SP1"]`) |
-| `model_type` | `None` | Score all models of a type: `"TF"` (458 models) or `"HISTONE"` (4 models) |
+| `models` | required | List of model names (e.g., `["CTCFL", "SP1"]` or `["splice_acceptor"]`) |
+| `model_type` | `None` | Score all models of a type: `"TF"` (458 models), `"HISTONE"` (4 models), or `"SPLICE"` (2 models) |
 | `batch_size` | `32` | Batch size for GPU inference |
 | `gpus` | `[0]` | List of GPU device IDs for parallel inference |
 | `return_attention` | `False` | Extract DNABERT attention weights for interpretability |
@@ -262,7 +320,7 @@ DeepVRegulome/
 ├── src/deepvregulome/              # Python package (pip install deepvregulome)
 │   ├── __init__.py                 #   Public API: DVR class
 │   ├── dvr.py                      #   Main scoring engine
-│   ├── registry.py                 #   Model registry (462 models + metadata)
+│   ├── registry.py                 #   Model registry (464 models + metadata)
 │   ├── utils.py                    #   k-mer tokenization, sequence extraction
 │   └── cli.py                      #   Command-line interface
 ├── notebooks/                      # Tutorial notebooks (see below)
@@ -312,7 +370,7 @@ An interactive dashboard for exploring variant predictions and clinical stratifi
 
 ## Model Checkpoints
 
-All 462 fine-tuned DNABERT models (458 TFs + 4 histone marks) are hosted on HuggingFace:
+All 464 fine-tuned DNABERT models (458 TFs + 4 histone marks + 2 splice sites) are hosted on HuggingFace:
 
 **[https://huggingface.co/duttaprat/DeepVRegulome](https://huggingface.co/duttaprat/DeepVRegulome)**
 
@@ -323,11 +381,20 @@ For direct access without the `deepvregulome` package:
 ```python
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+# Load a TF model
 tokenizer = AutoTokenizer.from_pretrained(
     "duttaprat/DeepVRegulome", subfolder="models/CTCFL"
 )
 model = AutoModelForSequenceClassification.from_pretrained(
     "duttaprat/DeepVRegulome", subfolder="models/CTCFL"
+)
+
+# Load a splice-site model
+tokenizer = AutoTokenizer.from_pretrained(
+    "duttaprat/DeepVRegulome", subfolder="models/splice_acceptor"
+)
+model = AutoModelForSequenceClassification.from_pretrained(
+    "duttaprat/DeepVRegulome", subfolder="models/splice_acceptor"
 )
 ```
 
@@ -335,14 +402,14 @@ model = AutoModelForSequenceClassification.from_pretrained(
 
 ## Roadmap
 
-**Current capabilities (v0.1.8):**
-- Single-variant and batch VCF scoring with 462 ENCODE ChIP-seq models
+**Current capabilities (v0.4.0):**
+- Single-variant and batch VCF scoring with 464 models (458 TF + 4 histone + 2 splice)
+- Splice-site disruption scoring (acceptor + donor models)
 - Multi-GPU inference support
 - Attention-based interpretability
 - CLI and Python API
 
 **In development:**
-- Splice-site disruption scoring (acceptor + donor models)
 - JASPAR motif enrichment integration
 - Expanded model zoo: additional cell types and epigenomic marks
 - Conda package
