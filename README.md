@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://pypi.org/project/deepvregulome/"><img src="https://img.shields.io/pypi/v/deepvregulome?color=blue" alt="PyPI"></a>
-  [![PyPI Downloads](https://static.pepy.tech/personalized-badge/deepvregulome?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/deepvregulome)
+  <a href="https://pepy.tech/projects/deepvregulome"><img src="https://static.pepy.tech/personalized-badge/deepvregulome?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="PyPI Downloads"></a>
   <a href="https://huggingface.co/duttaprat/DeepVRegulome"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Models-yellow" alt="HuggingFace"></a>
   <a href="https://huggingface.co/spaces/duttaprat/DeepVRegulome"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Live%20Demo-blue" alt="HuggingFace Space"></a>
   <a href="https://arxiv.org/abs/2511.09026"><img src="https://img.shields.io/badge/arXiv-2511.09026-b31b1b" alt="arXiv"></a>
